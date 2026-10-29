@@ -1,0 +1,178 @@
+package eu.kanade.tachiyomi.ui.reader.viewer.pager
+
+import android.content.Context
+import android.graphics.Canvas
+import android.os.Parcelable
+import android.view.HapticFeedbackConstants
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.view.animation.DecelerateInterpolator
+import android.widget.Scroller
+import androidx.viewpager.widget.DirectionalViewPager
+import eu.kanade.tachiyomi.ui.reader.viewer.GestureDetectorWithLongTap
+import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
+
+/**
+ * Pager implementation that listens for tap and long tap and allows temporarily disabling touch
+ * events in order to work with child views that need to disable touch events on this parent. The
+ * pager can also be declared to be vertical by creating it with [isHorizontal] to false.
+ */
+open class Pager(
+    context: Context,
+    isHorizontal: Boolean = true,
+) : DirectionalViewPager(context, isHorizontal) {
+
+    init {
+        // Pager position is restored from ReaderPage index by the viewer. Letting ViewPager also
+        // restore its raw currentItem causes rotation to reapply stale spread positions.
+        isSaveEnabled = false
+        isSaveFromParentEnabled = false
+    }
+
+    internal var bookTurnPage: (() -> ReaderPageImageView?)? = null
+
+    override fun dispatchDraw(canvas: Canvas) {
+        val page = bookTurnPage?.invoke()?.takeIf { it.bookPageTurn != null }
+        if (page != null) {
+            val save = canvas.save()
+            canvas.translate(scrollX.toFloat(), scrollY.toFloat())
+            page.drawBookBackground(canvas)
+            canvas.restoreToCount(save)
+        }
+        super.dispatchDraw(canvas)
+        if (page == null) return
+        val save = canvas.save()
+        // Android offsets this canvas by the pager's scroll, so restore viewport coordinates.
+        canvas.translate(scrollX.toFloat(), scrollY.toFloat())
+        page.drawEnhancementStatus(canvas)
+        canvas.restoreToCount(save)
+    }
+
+    override fun onDescendantInvalidated(child: View, target: View) {
+        super.onDescendantInvalidated(child, target)
+        val page = target.parent as? ReaderPageImageView
+        if (bookTurnPage != null && page?.isEnhancementStatusView(target) == true) invalidate()
+    }
+
+    private var originalScroller: Scroller? = null
+    private var bookScroller: Scroller? = null
+
+    internal fun setBookTurnTiming(enabled: Boolean) {
+        val field = generateSequence(javaClass as Class<*>?) { it.superclass }
+            .mapNotNull { type -> runCatching { type.getDeclaredField("mScroller") }.getOrNull() }
+            .firstOrNull() ?: return
+        runCatching {
+            field.isAccessible = true
+            if (originalScroller == null) originalScroller = field.get(this) as? Scroller
+            if (enabled && bookScroller == null) {
+                bookScroller = object : Scroller(context, DecelerateInterpolator()) {
+                    override fun startScroll(startX: Int, startY: Int, dx: Int, dy: Int, duration: Int) {
+                        super.startScroll(startX, startY, dx, dy, BOOK_PAGE_TURN_MILLIS)
+                    }
+                }
+            }
+            field.set(this, if (enabled) bookScroller else originalScroller)
+        }
+    }
+
+    /**
+     * Tap listener function to execute when a tap is detected.
+     */
+    var tapListener: ((MotionEvent) -> Unit)? = null
+
+    /**
+     * Long tap listener function to execute when a long tap is detected.
+     */
+    var longTapListener: ((MotionEvent) -> Boolean)? = null
+
+    /**
+     * Gesture listener that implements tap and long tap events.
+     */
+    private val gestureListener = object : GestureDetectorWithLongTap.Listener() {
+        override fun onSingleTapConfirmed(ev: MotionEvent): Boolean {
+            tapListener?.invoke(ev)
+            return true
+        }
+
+        override fun onLongTapConfirmed(ev: MotionEvent) {
+            val listener = longTapListener
+            if (listener != null && listener.invoke(ev)) {
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            }
+        }
+    }
+
+    /**
+     * Gesture detector which handles motion events.
+     */
+    private val gestureDetector = GestureDetectorWithLongTap(context, gestureListener)
+
+    /**
+     * Whether the gesture detector is currently enabled.
+     */
+    private var isGestureDetectorEnabled = true
+
+    /**
+     * Dispatches a touch event.
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        val handled = super.dispatchTouchEvent(ev)
+        if (isGestureDetectorEnabled) {
+            gestureDetector.onTouchEvent(ev)
+        }
+        return handled
+    }
+
+    /**
+     * Whether the given [ev] should be intercepted. Only used to prevent crashes when child
+     * views manipulate [requestDisallowInterceptTouchEvent].
+     */
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        return try {
+            super.onInterceptTouchEvent(ev)
+        } catch (e: IllegalArgumentException) {
+            false
+        }
+    }
+
+    /**
+     * Handles a touch event. Only used to prevent crashes when child views manipulate
+     * [requestDisallowInterceptTouchEvent].
+     */
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        return try {
+            super.onTouchEvent(ev)
+        } catch (e: NullPointerException) {
+            false
+        } catch (e: IndexOutOfBoundsException) {
+            false
+        } catch (e: IllegalArgumentException) {
+            false
+        }
+    }
+
+    /**
+     * Executes the given key event when this pager has focus. Just do nothing because the reader
+     * already dispatches key events to the viewer and has more control than this method.
+     */
+    override fun executeKeyEvent(event: KeyEvent): Boolean {
+        // Disable viewpager's default key event handling
+        return false
+    }
+
+    /**
+     * Enables or disables the gesture detector.
+     */
+    fun setGestureDetectorEnabled(enabled: Boolean) {
+        isGestureDetectorEnabled = enabled
+    }
+
+    override fun onSaveInstanceState(): Parcelable? {
+        return null
+    }
+
+    override fun onRestoreInstanceState(state: Parcelable?) {
+        super.onRestoreInstanceState(null)
+    }
+}
