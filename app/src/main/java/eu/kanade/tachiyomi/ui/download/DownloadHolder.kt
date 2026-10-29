@@ -1,0 +1,142 @@
+package eu.kanade.tachiyomi.ui.download
+
+import android.view.View
+import androidx.recyclerview.widget.ItemTouchHelper
+import eu.davidea.viewholders.FlexibleViewHolder
+import eu.kanade.tachiyomi.R
+import eu.kanade.tachiyomi.data.download.model.Download
+import eu.kanade.tachiyomi.databinding.DownloadItemBinding
+import eu.kanade.tachiyomi.util.view.popupMenu
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.i18n.MR
+
+/**
+ * Class used to hold the data of a download.
+ * All the elements from the layout file "download_item" are available in this class.
+ *
+ * @param view the inflated view for this holder.
+ * @constructor creates a new download holder.
+ */
+class DownloadHolder(private val view: View, val adapter: DownloadAdapter) :
+    FlexibleViewHolder(view, adapter) {
+
+    private val binding = DownloadItemBinding.bind(view)
+
+    init {
+        setDragHandleView(binding.reorder)
+        binding.menu.setOnClickListener { it.post { showPopupMenu(it) } }
+    }
+
+    private lateinit var download: Download
+    private var isUpload: Boolean = false
+
+    /**
+     * Binds this holder with the given category.
+     *
+     * @param category The category to bind.
+     */
+    fun bind(download: Download, isUpload: Boolean) {
+        this.download = download
+        this.isUpload = isUpload
+        binding.reorder.visibility = if (isUpload) View.INVISIBLE else View.VISIBLE
+        binding.menu.visibility = View.VISIBLE
+
+        // Update the chapter name.
+        binding.chapterTitle.text = download.chapter.name
+
+        // Update the manga title
+        binding.mangaFullTitle.text = download.manga.title
+
+        // Update the progress bar and the number of downloaded pages
+        val pages = download.pages
+        if (isUpload && download.status == Download.State.ERROR) {
+            binding.downloadProgress.progress = download.uploadProgress
+            binding.downloadProgress.max = 100
+            binding.downloadProgressText.text = view.context.stringResource(MR.strings.chapter_paused)
+        } else if (download.status == Download.State.UPLOADING) {
+            binding.downloadProgress.progress = download.uploadProgress
+            binding.downloadProgress.max = 100
+            notifyDownloadedPages()
+        } else if (pages == null) {
+            binding.downloadProgress.progress = 0
+            binding.downloadProgress.max = 1
+            binding.downloadProgressText.text = ""
+        } else {
+            binding.downloadProgress.max = pages.size * 100
+            notifyProgress()
+            notifyDownloadedPages()
+        }
+    }
+
+    /**
+     * Updates the progress bar of the download.
+     */
+    fun notifyProgress() {
+        if (isUpload && download.status == Download.State.ERROR) {
+            binding.downloadProgress.max = 100
+            binding.downloadProgress.setProgressCompat(download.uploadProgress, true)
+            return
+        }
+        if (download.status == Download.State.UPLOADING) {
+            binding.downloadProgress.max = 100
+            binding.downloadProgress.setProgressCompat(download.uploadProgress, true)
+            return
+        }
+        val pages = download.pages ?: return
+        if (binding.downloadProgress.max == 1) {
+            binding.downloadProgress.max = pages.size * 100
+        }
+        binding.downloadProgress.setProgressCompat(download.totalProgress, true)
+    }
+
+    /**
+     * Updates the text field of the number of downloaded pages.
+     */
+    fun notifyDownloadedPages() {
+        if (isUpload && download.status == Download.State.ERROR) {
+            binding.downloadProgressText.text = view.context.stringResource(MR.strings.chapter_paused)
+            return
+        }
+        if (download.status == Download.State.UPLOADING) {
+            binding.downloadProgressText.text = view.context.stringResource(
+                MR.strings.cloud_sync_uploading_progress,
+                download.uploadProgress,
+            )
+            return
+        }
+        val pages = download.pages ?: return
+        binding.downloadProgressText.text = "${download.downloadedImages}/${pages.size}"
+    }
+
+    override fun onItemReleased(position: Int) {
+        super.onItemReleased(position)
+        adapter.downloadItemListener.onItemReleased(position)
+        binding.container.isDragged = false
+    }
+
+    override fun onActionStateChanged(position: Int, actionState: Int) {
+        super.onActionStateChanged(position, actionState)
+        if (actionState == ItemTouchHelper.ACTION_STATE_DRAG) {
+            binding.container.isDragged = true
+        }
+    }
+
+    private fun showPopupMenu(view: View) {
+        view.popupMenu(
+            menuRes = if (isUpload) R.menu.upload_single else R.menu.download_single,
+            initMenu = {
+                if (isUpload) {
+                    findItem(R.id.resume_upload).isVisible = download.status == Download.State.ERROR
+                    findItem(R.id.pause_upload).isVisible = download.status != Download.State.ERROR
+                } else {
+                    findItem(R.id.move_to_top).isVisible = bindingAdapterPosition > 1
+                    findItem(R.id.move_to_bottom).isVisible =
+                        bindingAdapterPosition != adapter.itemCount - 1
+                }
+            },
+            onMenuItemClick = {
+                adapter.downloadItemListener.onMenuItemClick(bindingAdapterPosition, this)
+            },
+        )
+    }
+}

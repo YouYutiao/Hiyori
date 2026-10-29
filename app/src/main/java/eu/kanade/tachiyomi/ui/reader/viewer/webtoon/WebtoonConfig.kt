@@ -1,0 +1,282 @@
+package eu.kanade.tachiyomi.ui.reader.viewer.webtoon
+
+import android.app.Application
+import android.content.res.Configuration
+import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import eu.kanade.tachiyomi.ui.reader.viewer.ViewerConfig
+import eu.kanade.tachiyomi.ui.reader.viewer.ViewerNavigation
+import eu.kanade.tachiyomi.ui.reader.viewer.navigation.DisabledNavigation
+import eu.kanade.tachiyomi.ui.reader.viewer.navigation.EdgeNavigation
+import eu.kanade.tachiyomi.ui.reader.viewer.navigation.KindlishNavigation
+import eu.kanade.tachiyomi.ui.reader.viewer.navigation.LNavigation
+import eu.kanade.tachiyomi.ui.reader.viewer.navigation.RightAndLeftNavigation
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.flow.onEach
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+
+/**
+ * Configuration used by webtoon viewers.
+ */
+class WebtoonConfig(
+    scope: CoroutineScope,
+    readerPreferences: ReaderPreferences = Injekt.get(),
+) : ViewerConfig(
+    readerPreferences,
+    scope,
+    isLandscape = {
+        Injekt.get<Application>().resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    },
+) {
+    private val appContext = Injekt.get<Application>()
+
+    var themeChangedListener: (() -> Unit)? = null
+
+    var imageCropBorders = false
+        private set
+
+    var zoomOutDisabled = false
+        private set
+
+    var zoomPropertyChangedListener: ((Boolean) -> Unit)? = null
+
+    var sidePadding = 0
+        private set
+
+    var doubleTapZoom = true
+        private set
+
+    var doubleTapZoomChangedListener: ((Boolean) -> Unit)? = null
+
+    val theme = readerPreferences.readerTheme.get()
+
+    init {
+        readerPreferences.cropBordersWebtoon
+            .register({ imageCropBorders = it }, { imagePropertyChangedListener?.invoke() })
+
+        readerPreferences.webtoonSidePadding
+            .register({ sidePadding = it }, { imagePropertyChangedListener?.invoke() })
+
+        readerPreferences.navigationModeWebtoon
+            .register({ navigationMode = it }, { updateNavigation(it) })
+
+        readerPreferences.webtoonNavInverted
+            .register({ tappingInverted = it }, { navigator.invertMode = it })
+        readerPreferences.webtoonNavInverted.changes()
+            .drop(1)
+            .onEach { navigationModeChangedListener?.invoke() }
+            .launchIn(scope)
+
+        readerPreferences.dualPageSplitWebtoon
+            .register({ dualPageSplit = it }, { imagePropertyChangedListener?.invoke() })
+
+        readerPreferences.dualPageInvertWebtoon
+            .register({ dualPageInvert = it }, { imagePropertyChangedListener?.invoke() })
+
+        readerPreferences.dualPageRotateToFitWebtoon
+            .register(
+                { dualPageRotateToFit = it },
+                { imagePropertyChangedListener?.invoke() },
+            )
+
+        readerPreferences.dualPageRotateToFitInvertWebtoon
+            .register(
+                { dualPageRotateToFitInvert = it },
+                { imagePropertyChangedListener?.invoke() },
+            )
+
+        readerPreferences.webtoonDisableZoomOut
+            .register(
+                { zoomOutDisabled = it },
+                { zoomPropertyChangedListener?.invoke(it) },
+            )
+
+        readerPreferences.webtoonDoubleTapZoomEnabled
+            .register(
+                { doubleTapZoom = it },
+                { doubleTapZoomChangedListener?.invoke(it) },
+            )
+
+        readerPreferences.readerTheme.changes()
+            .drop(1)
+            .distinctUntilChanged()
+            .onEach { themeChangedListener?.invoke() }
+            .launchIn(scope)
+
+        // See PagerConfig for the cancel/clear policy: cancelAll always runs; the
+        // cache-wide clear only fires for settings that change what a product means.
+        readerPreferences.realCuganEnabled().changes()
+            .drop(1)
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganEnabled changed")
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganModel().changes()
+            .drop(1)
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganModel changed")
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realEsrganStyle().changes()
+            .drop(1)
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realEsrganStyle changed")
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganNoiseLevel().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganNoiseLevel changed") }
+            .debounce(500)
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganScale().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganScale changed") }
+            .debounce(500)
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganMaxSizeWidth().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganMaxSizeWidth changed") }
+            .debounce(500)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganMaxSizeHeight().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganMaxSizeHeight changed") }
+            .debounce(500)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganSkipMaxSizeWidth().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganSkipMaxSizeWidth changed") }
+            .debounce(500)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganSkipMaxSizeHeight().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganSkipMaxSizeHeight changed") }
+            .debounce(500)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganTileSize().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganTileSize changed") }
+            .debounce(500)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganPrecision().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganPrecision changed") }
+            .debounce(500)
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganProcessingBackend().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganProcessingBackend changed") }
+            .debounce(500)
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganFp16Arithmetic().changes()
+            .drop(1)
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganFp16Arithmetic changed") }
+            .debounce(500)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        merge<Any>(
+            readerPreferences.inkFilter().changes().drop(1),
+            readerPreferences.inkBleedingIntensity().changes().drop(1),
+            readerPreferences.inkBumpIntensity().changes().drop(1),
+            readerPreferences.inkOriginalIntensity().changes().drop(1),
+        )
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("ink filter changed") }
+            .debounce(500)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganShowStatus().changes()
+            .drop(1)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+
+        readerPreferences.realCuganPreloadSize().changes()
+            .drop(1)
+            .onEach {
+                imagePropertyChangedListener?.invoke()
+            }
+            .launchIn(scope)
+    }
+
+    override var navigator: ViewerNavigation = defaultNavigation()
+        set(value) {
+            field = value.also { it.invertMode = tappingInverted }
+        }
+
+    override fun defaultNavigation(): ViewerNavigation {
+        return LNavigation()
+    }
+
+    override fun updateNavigation(navigationMode: Int) {
+        this.navigator = when (navigationMode) {
+            0 -> defaultNavigation()
+            1 -> LNavigation()
+            2 -> KindlishNavigation()
+            3 -> EdgeNavigation()
+            4 -> RightAndLeftNavigation()
+            5 -> DisabledNavigation()
+            else -> defaultNavigation()
+        }
+        navigationModeChangedListener?.invoke()
+    }
+}

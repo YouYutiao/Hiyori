@@ -1,0 +1,30 @@
+# Build files
+.gradle
+.kotlin
+build
+app/.cxx/
+app/release/
+
+# IDE files
+*.iml
+.idea/*
+!.idea/icon.svg
+/captures
+
+# Configuration files
+keystore.properties
+local.properties
+
+# Signing keys
+*.jks
+
+# Android specific ignores
+*.dm
+*.apk
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# macOS specific files
+.DS_Store

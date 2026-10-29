@@ -1,0 +1,1509 @@
+package eu.kanade.tachiyomi.ui.reader
+
+import android.annotation.SuppressLint
+import android.app.assist.AssistContent
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.view.View.LAYER_TYPE_HARDWARE
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.activity.addCallback
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.dp
+import androidx.core.content.getSystemService
+import androidx.core.graphics.Insets
+import androidx.core.net.toUri
+import androidx.core.transition.doOnEnd
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
+import com.google.android.material.transition.platform.MaterialContainerTransform
+import dev.zacsweers.metro.Inject
+import eu.kanade.domain.base.BasePreferences
+import eu.kanade.presentation.reader.DisplayRefreshHost
+import eu.kanade.presentation.reader.OrientationSelectDialog
+import eu.kanade.presentation.reader.PageLayoutSelectDialog
+import eu.kanade.presentation.reader.ReaderContentOverlay
+import eu.kanade.presentation.reader.ReaderEnhancementStatusIndicator
+import eu.kanade.presentation.reader.ReaderPageActionsDialog
+import eu.kanade.presentation.reader.ReaderPageIndicator
+import eu.kanade.presentation.reader.ReadingModeSelectDialog
+import eu.kanade.presentation.reader.appbars.ReaderAppBars
+import eu.kanade.presentation.reader.components.ChapterNavigatorType
+import eu.kanade.presentation.reader.settings.ReaderSettingsDialog
+import eu.kanade.tachiyomi.R
+import eu.kanade.tachiyomi.data.notification.NotificationReceiver
+import eu.kanade.tachiyomi.data.notification.Notifications
+import eu.kanade.tachiyomi.data.prewarm.PrewarmManager
+import eu.kanade.tachiyomi.databinding.ReaderActivityBinding
+import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.ui.base.activity.BaseActivity
+import eu.kanade.tachiyomi.ui.main.MainActivity
+import eu.kanade.tachiyomi.ui.reader.ReaderViewModel.SetAsCoverResult.AddToLibraryFirst
+import eu.kanade.tachiyomi.ui.reader.ReaderViewModel.SetAsCoverResult.Error
+import eu.kanade.tachiyomi.ui.reader.ReaderViewModel.SetAsCoverResult.Success
+import eu.kanade.tachiyomi.ui.reader.model.ReaderChapter
+import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
+import eu.kanade.tachiyomi.ui.reader.model.ViewerChapters
+import eu.kanade.tachiyomi.ui.reader.setting.ReaderOrientation
+import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import eu.kanade.tachiyomi.ui.reader.setting.ReaderSettingsViewModel
+import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
+import eu.kanade.tachiyomi.ui.reader.spatial.DepthSpatialModel
+import eu.kanade.tachiyomi.ui.reader.spatial.DepthSpatialPipeline
+import eu.kanade.tachiyomi.ui.reader.spatial.SpatialDepthSceneIO
+import eu.kanade.tachiyomi.ui.reader.spatial.SpatialSceneControlsView
+import eu.kanade.tachiyomi.ui.reader.spatial.SpatialSceneView
+import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
+import eu.kanade.tachiyomi.ui.reader.viewer.pager.PagerViewer
+import eu.kanade.tachiyomi.ui.reader.viewer.pager.R2LPagerViewer
+import eu.kanade.tachiyomi.ui.reader.viewer.webgpu.WebGpuViewer
+import eu.kanade.tachiyomi.ui.webview.WebViewActivity
+import eu.kanade.tachiyomi.util.mediatek.MediaTekNpu
+import eu.kanade.tachiyomi.util.system.openInBrowser
+import eu.kanade.tachiyomi.util.system.readerBackgroundColor
+import eu.kanade.tachiyomi.util.system.toShareIntent
+import eu.kanade.tachiyomi.util.system.toast
+import eu.kanade.tachiyomi.util.view.setComposeContent
+import eu.kanade.tachiyomi.util.waifu2x.EnhancementStatusBus
+import eu.kanade.tachiyomi.util.waifu2x.PageEnhanceState
+import eu.kanade.tachiyomi.util.waifu2x.Waifu2x
+import eu.kanade.tachiyomi.util.waifu2x.label
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.sample
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import logcat.LogPriority
+import mihon.app.di.AppGraph
+import mihon.core.metro.metroGraph
+import tachiyomi.core.common.Constants
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.core.common.util.lang.launchIO
+import tachiyomi.core.common.util.lang.launchNonCancellable
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.util.collectAsState
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+import java.io.ByteArrayOutputStream
+import java.util.Locale
+import kotlin.time.Duration.Companion.seconds
+
+// ReaderSettingsDialog tab order: 0 reading mode, 1 general, 2 custom filter (image enhancement).
+private const val ENHANCE_SETTINGS_TAB_INDEX = 2
+
+class ReaderActivity : BaseActivity() {
+
+    private val graph: AppGraph by lazy { metroGraph() }
+
+    companion object {
+        private const val UI_BUSY_COOLDOWN_MS = 1_000L
+
+        fun newIntent(context: Context, mangaId: Long?, chapterId: Long?): Intent {
+            return Intent(context, ReaderActivity::class.java).apply {
+                putExtra("manga", mangaId)
+                putExtra("chapter", chapterId)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+        }
+    }
+
+    @Inject private lateinit var readerPreferences: ReaderPreferences
+
+    @Inject private lateinit var preferences: BasePreferences
+
+    // Reports foreground state to the prewarm queue: offline enhancement must not
+    // compete with active reading.
+    @Inject private lateinit var prewarmManager: PrewarmManager
+
+    lateinit var binding: ReaderActivityBinding
+
+    val viewModel by viewModels<ReaderViewModel> { graph.viewModelFactory }
+    private var assistUrl: String? = null
+
+    /**
+     * Configuration at reader level, like background color or forced orientation.
+     */
+    private var config: ReaderConfig? = null
+
+    private var menuToggleToast: Toast? = null
+    private var readingModeToast: Toast? = null
+    private val displayRefreshHost = DisplayRefreshHost()
+
+    private val windowInsetsController by lazy { WindowInsetsControllerCompat(window, window.decorView) }
+
+    private var loadingIndicator: ReaderProgressIndicator? = null
+
+    var isScrollingThroughPages = false
+        private set
+
+    private var uiBusyJob: kotlinx.coroutines.Job? = null
+
+    private val spatialPipeline by lazy { DepthSpatialPipeline(applicationContext) }
+    private val spatialModel by lazy { DepthSpatialModel(applicationContext) }
+    private var spatialSceneView: SpatialSceneView? = null
+    private var spatialSceneContainer: FrameLayout? = null
+    private var spatialSceneControls: SpatialSceneControlsView? = null
+    private var spatialSceneJob: Job? = null
+    private var spatialScenePageKey: Pair<Long?, Int>? = null
+    private var spatialMotionSensitivity = 1f
+    private var spatialDepthStrength = 1f
+    private var spatialRotationAngleX = 7.9f
+    private var spatialRotationAngleY = 6.2f
+    private var spatialRotationAngleZ = 4.5f
+    private var spatialSceneActive by mutableStateOf(false)
+    private var spatialSceneBusy by mutableStateOf(false)
+    private var showSpatialModelDownloadDialog by mutableStateOf(false)
+    private var spatialModelDownloadProgress by mutableStateOf<Int?>(null)
+    private var spatialModelCompiling by mutableStateOf(false)
+    private var spatialModelCompileHtpVersion by mutableStateOf<Int?>(null)
+
+    /**
+     * Called when the activity is created. Initializes the presenter and configuration.
+     */
+    override fun onCreate(savedInstanceState: Bundle?) {
+        graph.inject(this)
+        registerSecureActivity(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(
+                OVERRIDE_TRANSITION_OPEN,
+                R.anim.shared_axis_x_push_enter,
+                R.anim.shared_axis_x_push_exit,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(R.anim.shared_axis_x_push_enter, R.anim.shared_axis_x_push_exit)
+        }
+
+        enableEdgeToEdge()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+        }
+        windowInsetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
+        super.onCreate(savedInstanceState)
+
+        binding = ReaderActivityBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        binding.setComposeOverlay()
+
+        onBackPressedDispatcher.addCallback(this) {
+            if (spatialSceneActive || spatialSceneBusy) {
+                hideSpatialScene()
+            } else {
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+                isEnabled = true
+            }
+        }
+
+        if (!viewModel.hasValidArgs) {
+            finish()
+            return
+        }
+
+        NotificationReceiver.dismissNotification(this, viewModel.mangaId.hashCode(), Notifications.ID_NEW_CHAPTERS)
+
+        config = ReaderConfig()
+        setMenuVisibility(viewModel.state.value.menuVisible)
+
+        // Finish when incognito mode is disabled
+        preferences.incognitoMode.changes()
+            .drop(1)
+            .onEach { if (!it) finish() }
+            .launchIn(lifecycleScope)
+
+        viewModel.state
+            .map { it.initError }
+            .distinctUntilChanged()
+            .filterNotNull()
+            .onEach(::setInitialChapterError)
+            .launchIn(lifecycleScope)
+
+        viewModel.state
+            .map { it.isLoadingAdjacentChapter }
+            .distinctUntilChanged()
+            .onEach(::setProgressDialog)
+            .launchIn(lifecycleScope)
+
+        viewModel.state
+            .map { it.manga }
+            .distinctUntilChanged()
+            .filterNotNull()
+            .onEach { updateViewer() }
+            .launchIn(lifecycleScope)
+
+        viewModel.state
+            .map { it.viewerChapters }
+            .distinctUntilChanged()
+            .filterNotNull()
+            .onEach(::setChapters)
+            .launchIn(lifecycleScope)
+
+        viewModel.eventFlow
+            .onEach { event ->
+                when (event) {
+                    ReaderViewModel.Event.ReloadViewerChapters -> {
+                        viewModel.state.value.viewerChapters?.let(::setChapters)
+                    }
+                    ReaderViewModel.Event.PageChanged -> {
+                        displayRefreshHost.flash()
+                    }
+                    is ReaderViewModel.Event.SetOrientation -> {
+                        setOrientation(event.orientation)
+                    }
+                    is ReaderViewModel.Event.SavedImage -> {
+                        onSaveImageResult(event.result)
+                    }
+                    is ReaderViewModel.Event.ShareImage -> {
+                        onShareImageResult(event.uri, event.page)
+                    }
+                    is ReaderViewModel.Event.CopyImage -> {
+                        onCopyImageResult(event.uri)
+                    }
+                    is ReaderViewModel.Event.SetCoverResult -> {
+                        onSetAsCoverResult(event.result)
+                    }
+                }
+            }
+            .launchIn(lifecycleScope)
+
+        viewModel.state
+            .map { it.menuVisible }
+            .distinctUntilChanged()
+            .onEach { menuVisible ->
+                if (menuVisible) {
+                    uiBusyJob?.cancel()
+                    Waifu2x.setUiBusy(true)
+                } else {
+                    onUiInteracted()
+                }
+            }
+            .launchIn(lifecycleScope)
+
+        if (readerPreferences.waifu2xEnabled().get()) {
+            Waifu2x.init(this, readerPreferences.waifu2xNoiseLevel().get())
+        }
+    }
+
+    private fun ReaderActivityBinding.setComposeOverlay(): Unit = composeOverlay.setComposeContent {
+        val state by viewModel.state.collectAsState()
+        val showPageNumber by readerPreferences.showPageNumber.collectAsState()
+        val indicatorMode by readerPreferences.enhancementIndicatorMode().collectAsState()
+        val settingsviewModel = remember {
+            ReaderSettingsViewModel(
+                readerState = viewModel.state,
+                onChangeReadingMode = viewModel::setMangaReadingMode,
+                onChangeOrientation = viewModel::setMangaOrientationType,
+                onChangeDoublePageShift = viewModel::setDoublePageShift,
+                preferences = readerPreferences,
+                prewarmManager = prewarmManager,
+            )
+        }
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            val enhanceStates by EnhancementStatusBus.states.collectAsState()
+            val currentPageEnhanceState = EnhancementStatusBus.stateFor(state.currentPage)
+
+            // The four display modes are two independent flags; deriving them once keeps the
+            // page number marker and the corner badge in sync with the single radio choice.
+            val starEnabled = indicatorMode == ReaderPreferences.INDICATOR_MODE_PAGE_NUMBER ||
+                indicatorMode == ReaderPreferences.INDICATOR_MODE_BOTH
+            val badgeEnabled = indicatorMode == ReaderPreferences.INDICATOR_MODE_BADGE ||
+                indicatorMode == ReaderPreferences.INDICATOR_MODE_BOTH
+
+            if (!state.menuVisible && showPageNumber) {
+                ReaderPageIndicator(
+                    currentPage = state.currentPage,
+                    totalPages = state.totalPages,
+                    enhanced = starEnabled && currentPageEnhanceState == PageEnhanceState.Enhanced,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding(),
+                )
+            }
+
+            // Screen-anchored enhancement status of the current page; always one of the three
+            // states while reading (no auto-hide), offset from the corner by safe insets plus
+            // margins so rounded corners and cutouts never cover it.
+            if (!state.menuVisible && badgeEnabled) {
+                val label = when (val enhanceState = currentPageEnhanceState) {
+                    null, PageEnhanceState.Raw -> stringResource(MR.strings.reader_status_raw)
+                    else -> {
+                        val (res, arg) = enhanceState.label()
+                        if (arg != null) stringResource(res, arg) else stringResource(res)
+                    }
+                }
+                ReaderEnhancementStatusIndicator(
+                    label = label,
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .safeDrawingPadding()
+                        .padding(start = 20.dp, bottom = 20.dp)
+                        // Announced when the state changes, so the badge is usable without sight.
+                        .semantics { liveRegion = LiveRegionMode.Polite },
+                )
+            }
+
+            // A chapter that a prewarm run finished needs a one-shot explanation when neither
+            // indicator is drawn: judging it from the badge alone would be impossible.
+            val prewarmedChapterIds by prewarmManager.prewarmedChapterIds.collectAsState()
+            val currentChapterId = state.currentChapter?.chapter?.id
+            var showPrewarmAttribution by remember(currentChapterId) { mutableStateOf(false) }
+            // showPageNumber is a key: the eligibility below reads it, so toggling page numbers
+            // mid-chapter must restart this effect (star appearing/disappearing changes eligibility).
+            LaunchedEffect(currentChapterId, indicatorMode, showPageNumber, prewarmedChapterIds) {
+                showPrewarmAttribution = false
+                if (currentChapterId == null) return@LaunchedEffect
+                val starVisible = starEnabled && showPageNumber
+                val eligible = !badgeEnabled && !starVisible && currentChapterId in prewarmedChapterIds
+                if (!eligible) return@LaunchedEffect
+                showPrewarmAttribution = true
+                delay(2_000)
+                showPrewarmAttribution = false
+            }
+            AnimatedVisibility(
+                visible = showPrewarmAttribution && !state.menuVisible,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .safeDrawingPadding()
+                    .padding(bottom = 48.dp),
+            ) {
+                Text(
+                    text = stringResource(MR.strings.prewarm_reader_attribution),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            ContentOverlay(state = state)
+
+            AppBars(state = state)
+        }
+
+        val onDismissRequest = viewModel::closeDialog
+        var openEnhanceTabFromOnboarding by remember { mutableStateOf(false) }
+        when (state.dialog) {
+            is ReaderViewModel.Dialog.Loading -> {
+                AlertDialog(
+                    onDismissRequest = {},
+                    confirmButton = {},
+                    text = {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator()
+                            Text(stringResource(MR.strings.loading))
+                        }
+                    },
+                )
+            }
+            is ReaderViewModel.Dialog.Settings -> {
+                ReaderSettingsDialog(
+                    initialTab = if (openEnhanceTabFromOnboarding) ENHANCE_SETTINGS_TAB_INDEX else 0,
+                    onDismissRequest = {
+                        openEnhanceTabFromOnboarding = false
+                        onDismissRequest()
+                    },
+                    onShowMenus = { setMenuVisibility(true) },
+                    onHideMenus = { setMenuVisibility(false) },
+                    viewModel = settingsviewModel,
+                )
+            }
+            is ReaderViewModel.Dialog.ReadingModeSelect -> {
+                ReadingModeSelectDialog(
+                    onDismissRequest = onDismissRequest,
+                    viewModel = settingsviewModel,
+                    onChange = { stringRes ->
+                        menuToggleToast?.cancel()
+                        if (!readerPreferences.showReadingMode.get()) {
+                            menuToggleToast = toast(stringRes)
+                        }
+                    },
+                )
+            }
+            is ReaderViewModel.Dialog.PageLayoutSelect -> {
+                PageLayoutSelectDialog(
+                    onDismissRequest = onDismissRequest,
+                    screenModel = settingsviewModel,
+                    onChange = { stringRes ->
+                        menuToggleToast?.cancel()
+                        menuToggleToast = toast(stringRes)
+                    },
+                )
+            }
+            is ReaderViewModel.Dialog.OrientationModeSelect -> {
+                OrientationSelectDialog(
+                    onDismissRequest = onDismissRequest,
+                    viewModel = settingsviewModel,
+                    onChange = { stringRes ->
+                        menuToggleToast?.cancel()
+                        menuToggleToast = toast(stringRes)
+                    },
+                )
+            }
+            is ReaderViewModel.Dialog.PageActions -> {
+                ReaderPageActionsDialog(
+                    onDismissRequest = onDismissRequest,
+                    onSetAsCover = viewModel::setAsCover,
+                    onShare = viewModel::shareImage,
+                    onSave = viewModel::saveImage,
+                )
+            }
+            null -> {}
+        }
+
+        // One-time discoverability prompt for the enhancement feature. Never shown to
+        // users who already enabled enhancement; dismissed either way, forever.
+        val realCuganEnabledForOnboarding by readerPreferences.realCuganEnabled().collectAsState()
+        val enhancementOnboardingShown by readerPreferences.enhancementOnboardingShown().collectAsState()
+        if (!realCuganEnabledForOnboarding && !enhancementOnboardingShown) {
+            val npuAvailable = remember { Waifu2x.isQualcommNpuAvailable() || MediaTekNpu.isDeviceSupported() }
+            AlertDialog(
+                onDismissRequest = { readerPreferences.enhancementOnboardingShown().set(true) },
+                title = { Text(text = stringResource(MR.strings.enhancement_onboarding_title)) },
+                text = {
+                    Text(
+                        text = stringResource(
+                            if (npuAvailable) {
+                                MR.strings.enhancement_onboarding_message_npu
+                            } else {
+                                MR.strings.enhancement_onboarding_message
+                            },
+                        ),
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            readerPreferences.enhancementOnboardingShown().set(true)
+                            openEnhanceTabFromOnboarding = true
+                            viewModel.openSettingsDialog()
+                        },
+                    ) { Text(text = stringResource(MR.strings.enhancement_onboarding_enable)) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { readerPreferences.enhancementOnboardingShown().set(true) }) {
+                        Text(text = stringResource(MR.strings.enhancement_onboarding_dismiss))
+                    }
+                },
+            )
+        }
+
+        if (showSpatialModelDownloadDialog) {
+            AlertDialog(
+                onDismissRequest = {
+                    if (spatialModelDownloadProgress == null) showSpatialModelDownloadDialog = false
+                },
+                title = { Text(stringResource(MR.strings.reader_spatial_scene_download_title)) },
+                text = {
+                    val progress = spatialModelDownloadProgress
+                    if (progress == null) {
+                        Text(stringResource(MR.strings.reader_spatial_scene_download_message))
+                    } else {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator()
+                            Text(stringResource(MR.strings.reader_spatial_scene_downloading, progress))
+                        }
+                    }
+                },
+                confirmButton = {
+                    if (spatialModelDownloadProgress == null) {
+                        TextButton(onClick = ::downloadSpatialModel) {
+                            Text(stringResource(MR.strings.reader_spatial_scene_download))
+                        }
+                    }
+                },
+                dismissButton = {
+                    if (spatialModelDownloadProgress == null) {
+                        TextButton(onClick = { showSpatialModelDownloadDialog = false }) {
+                            Text(stringResource(MR.strings.action_cancel))
+                        }
+                    }
+                },
+            )
+        }
+
+        if (spatialModelCompiling) {
+            AlertDialog(
+                onDismissRequest = {},
+                title = { Text(stringResource(MR.strings.reader_spatial_scene_compile_title)) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text(
+                            stringResource(
+                                MR.strings.reader_spatial_scene_compiling,
+                                spatialModelCompileHtpVersion?.let { "v$it" } ?: "HTP",
+                            ),
+                        )
+                    }
+                },
+                confirmButton = {},
+            )
+        }
+    }
+
+    /**
+     * Called when the activity is destroyed. Cleans up the viewer, configuration and any view.
+     */
+    override fun onDestroy() {
+        hideSpatialScene()
+        uiBusyJob?.cancel()
+        Waifu2x.setUiBusy(false)
+        viewModel.state.value.viewer?.destroy()
+
+        config = null
+        menuToggleToast?.cancel()
+        readingModeToast?.cancel()
+        super.onDestroy()
+    }
+
+    override fun onPause() {
+        prewarmManager.onReaderActive(false)
+        spatialSceneView?.stopMotion()
+        persistCurrentPagerPage()
+        viewModel.saveHistory()
+        super.onPause()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        persistCurrentPagerPage()
+        super.onSaveInstanceState(outState)
+    }
+
+    /**
+     * Set menu visibility again on activity resume to apply immersive mode again if needed.
+     * Helps with rotations.
+     */
+    override fun onResume() {
+        super.onResume()
+        prewarmManager.onReaderActive(true)
+        spatialSceneView?.startMotion()
+        viewModel.restartReadTimer()
+        setMenuVisibility(viewModel.state.value.menuVisible)
+    }
+
+    /**
+     * Called when the window focus changes. It sets the menu visibility to the last known state
+     * to apply immersive mode again if needed.
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            setMenuVisibility(viewModel.state.value.menuVisible)
+        }
+    }
+
+    override fun onProvideAssistContent(outContent: AssistContent) {
+        super.onProvideAssistContent(outContent)
+        assistUrl?.let { outContent.webUri = it.toUri() }
+    }
+
+    /**
+     * Called when the user clicks the back key or the button on the toolbar. The call is
+     * delegated to the presenter.
+     */
+    override fun finish() {
+        viewModel.onActivityFinish()
+        super.finish()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(
+                OVERRIDE_TRANSITION_CLOSE,
+                R.anim.shared_axis_x_pop_enter,
+                R.anim.shared_axis_x_pop_exit,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(R.anim.shared_axis_x_pop_enter, R.anim.shared_axis_x_pop_exit)
+        }
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_N) {
+            loadNextChapter()
+            return true
+        } else if (keyCode == KeyEvent.KEYCODE_P) {
+            loadPreviousChapter()
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    /**
+     * Dispatches a key event. If the viewer doesn't handle it, call the default implementation.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val handled = viewModel.state.value.viewer?.handleKeyEvent(event) ?: false
+        if (handled) onUiInteracted()
+        return handled || super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * Dispatches a generic motion event. If the viewer doesn't handle it, call the default
+     * implementation.
+     */
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val handled = viewModel.state.value.viewer?.handleGenericMotionEvent(event) ?: false
+        if (handled) onUiInteracted()
+        return handled || super.dispatchGenericMotionEvent(event)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean {
+        onUiInteracted()
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun onUiInteracted() {
+        Waifu2x.setUiBusy(true)
+        uiBusyJob?.cancel()
+        uiBusyJob = lifecycleScope.launch {
+            delay(UI_BUSY_COOLDOWN_MS)
+            if (!viewModel.state.value.menuVisible) {
+                Waifu2x.setUiBusy(false)
+            }
+        }
+    }
+
+    @Composable
+    private fun ContentOverlay(state: ReaderViewModel.State) {
+        val flashOnPageChange by readerPreferences.flashOnPageChange.collectAsState()
+
+        val colorOverlayEnabled by readerPreferences.colorFilter.collectAsState()
+        val colorOverlay by readerPreferences.colorFilterValue.collectAsState()
+        val colorOverlayMode by readerPreferences.colorFilterMode.collectAsState()
+        val colorOverlayBlendMode = remember(colorOverlayMode) {
+            ReaderPreferences.ColorFilterMode.getOrNull(colorOverlayMode)?.second
+        }
+
+        ReaderContentOverlay(
+            brightness = state.brightnessOverlayValue,
+            color = colorOverlay.takeIf { colorOverlayEnabled },
+            colorBlendMode = colorOverlayBlendMode,
+        )
+
+        if (flashOnPageChange) {
+            DisplayRefreshHost(hostState = displayRefreshHost)
+        }
+    }
+
+    @Composable
+    fun AppBars(state: ReaderViewModel.State) {
+        val isHttpSource = state.source is HttpSource
+
+        val cropBorderPaged by readerPreferences.cropBorders.collectAsState()
+        val cropBorderWebtoon by readerPreferences.cropBordersWebtoon.collectAsState()
+        val imageEnhancementEnabled by readerPreferences.realCuganEnabled().collectAsState()
+        val isPagerType = ReadingMode.isPagerType(viewModel.getMangaReadingMode())
+        val cropEnabled = if (isPagerType) cropBorderPaged else cropBorderWebtoon
+
+        val verticalNavigatorModes by readerPreferences.verticalNavigator.collectAsState()
+        val verticalNavigator = verticalNavigatorModes.contains(
+            ReadingMode.fromPreference(viewModel.getMangaReadingMode()),
+        )
+        val verticalNavigatorOnLeft by readerPreferences.verticalNavigatorOnLeft.collectAsState()
+        val verticalNavigatorHeight by readerPreferences.verticalNavigatorHeight.collectAsState()
+
+        ReaderAppBars(
+            visible = state.menuVisible,
+
+            mangaTitle = state.manga?.title,
+            chapterTitle = state.currentChapter?.chapter?.name,
+            navigateUp = onBackPressedDispatcher::onBackPressed,
+            onClickTopAppBar = ::openMangaScreen,
+            bookmarked = state.bookmarked,
+            onToggleBookmarked = viewModel::toggleChapterBookmark,
+            onOpenInWebView = ::openChapterInWebView.takeIf { isHttpSource },
+            onOpenInBrowser = ::openChapterInBrowser.takeIf { isHttpSource },
+            onShare = ::shareChapter.takeIf { isHttpSource },
+
+            chapterNavigatorType = if (!verticalNavigator) {
+                if (state.viewer is R2LPagerViewer || (state.viewer as? WebGpuViewer)?.isReversed ?: false) {
+                    ChapterNavigatorType.HORIZONTAL_RTL
+                } else {
+                    ChapterNavigatorType.HORIZONTAL_LTR
+                }
+            } else {
+                if (verticalNavigatorOnLeft) {
+                    ChapterNavigatorType.VERTICAL_LEFT
+                } else {
+                    ChapterNavigatorType.VERTICAL_RIGHT
+                }
+            },
+            verticalNavigatorHeight = verticalNavigatorHeight / 100f,
+            onNextChapter = ::loadNextChapter,
+            enabledNext = state.viewerChapters?.nextChapter != null,
+            onPreviousChapter = ::loadPreviousChapter,
+            enabledPrevious = state.viewerChapters?.prevChapter != null,
+            currentPage = state.currentPage,
+            totalPages = state.totalPages,
+            onPageIndexChange = {
+                isScrollingThroughPages = true
+                moveToPageIndex(it)
+            },
+            onPageIndexChangeFinished = {
+                isScrollingThroughPages = false
+            },
+
+            readingMode = ReadingMode.fromPreference(
+                viewModel.getMangaReadingMode(resolveDefault = false),
+            ),
+            onClickReadingMode = viewModel::openReadingModeSelectDialog,
+            onClickPageLayout = viewModel::openPageLayoutSelectDialog,
+            orientation = ReaderOrientation.fromPreference(
+                viewModel.getMangaOrientation(resolveDefault = false),
+            ),
+            onClickOrientation = viewModel::openOrientationModeSelectDialog,
+            cropEnabled = cropEnabled,
+            onClickCropBorder = {
+                val enabled = viewModel.toggleCropBorders()
+                menuToggleToast?.cancel()
+                menuToggleToast = toast(if (enabled) MR.strings.on else MR.strings.off)
+            },
+            imageEnhancementEnabled = imageEnhancementEnabled,
+            onClickImageEnhancement = {
+                val enabled = viewModel.toggleImageEnhancement()
+                menuToggleToast?.cancel()
+                menuToggleToast = toast(
+                    stringResource(
+                        MR.strings.reader_image_enhancement_toast,
+                        stringResource(if (enabled) MR.strings.on else MR.strings.off),
+                    ),
+                )
+            },
+            spatialSceneActive = spatialSceneActive,
+            spatialSceneBusy = spatialSceneBusy,
+            onClickSpatialScene = ::toggleSpatialScene,
+            onClickSettings = viewModel::openSettingsDialog,
+        )
+    }
+
+    /**
+     * Sets the visibility of the menu according to [visible].
+     */
+    private fun setMenuVisibility(visible: Boolean) {
+        viewModel.showMenus(visible)
+        if (visible) {
+            windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
+        } else if (readerPreferences.fullscreen.get()) {
+            windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    /**
+     * Called from the presenter when a manga is ready. Used to instantiate the appropriate viewer.
+     */
+    private fun updateViewer() {
+        val prevViewer = viewModel.state.value.viewer
+        val newViewer = ReadingMode.toViewer(viewModel.getMangaReadingMode(), this)
+
+        if (window.sharedElementEnterTransition is MaterialContainerTransform) {
+            // Wait until transition is complete to avoid crash on API 26
+            window.sharedElementEnterTransition.doOnEnd {
+                setOrientation(viewModel.getMangaOrientation())
+            }
+        } else {
+            setOrientation(viewModel.getMangaOrientation())
+        }
+
+        // Destroy previous viewer if there was one
+        if (prevViewer != null) {
+            prevViewer.destroy()
+            binding.viewerContainer.removeAllViews()
+        }
+        viewModel.onViewerLoaded(newViewer)
+        updateViewerInset(readerPreferences.fullscreen.get(), readerPreferences.drawUnderCutout.get())
+        binding.viewerContainer.addView(newViewer.getView())
+
+        if (readerPreferences.showReadingMode.get()) {
+            showReadingModeToast(viewModel.getMangaReadingMode())
+        }
+
+        loadingIndicator = ReaderProgressIndicator(this)
+        binding.readerContainer.addView(loadingIndicator)
+
+        startPostponedEnterTransition()
+    }
+
+    private fun openMangaScreen() {
+        viewModel.manga?.id?.let { id ->
+            startActivity(
+                Intent(this, MainActivity::class.java).apply {
+                    action = Constants.SHORTCUT_MANGA
+                    putExtra(Constants.MANGA_EXTRA, id)
+                    addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                },
+            )
+        }
+    }
+
+    private fun openChapterInWebView() {
+        val manga = viewModel.manga ?: return
+        val source = viewModel.getSource() ?: return
+        assistUrl?.let {
+            val intent = WebViewActivity.newIntent(this@ReaderActivity, it, source.id, manga.title)
+            startActivity(intent)
+        }
+    }
+
+    private fun openChapterInBrowser() {
+        assistUrl?.let {
+            openInBrowser(it.toUri(), forceDefaultBrowser = false)
+        }
+    }
+
+    private fun shareChapter() {
+        assistUrl?.let {
+            val intent = it.toUri().toShareIntent(this, type = "text/plain")
+            startActivity(intent)
+        }
+    }
+
+    private fun showReadingModeToast(mode: Int) {
+        try {
+            readingModeToast?.cancel()
+            readingModeToast = toast(ReadingMode.fromPreference(mode).stringRes)
+        } catch (_: ArrayIndexOutOfBoundsException) {
+            logcat(LogPriority.ERROR) { "Unknown reading mode: $mode" }
+        }
+    }
+
+    /**
+     * Called from the presenter whenever a new [viewerChapters] have been set. It delegates the
+     * method to the current viewer, but also set the subtitle on the toolbar, and
+     * hides or disables the reader prev/next buttons if there's a prev or next chapter
+     */
+    @SuppressLint("RestrictedApi")
+    private fun setChapters(viewerChapters: ViewerChapters) {
+        binding.readerContainer.removeView(loadingIndicator)
+        viewModel.state.value.viewer?.setChapters(viewerChapters)
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            viewModel.getChapterUrl()?.let { url ->
+                assistUrl = url
+            }
+        }
+    }
+
+    /**
+     * Called from the presenter if the initial load couldn't load the pages of the chapter. In
+     * this case the activity is closed and a toast is shown to the user.
+     */
+    private fun setInitialChapterError(error: Throwable) {
+        logcat(LogPriority.ERROR, error)
+        finish()
+        toast(error.message)
+    }
+
+    /**
+     * Called from the presenter whenever it's loading the next or previous chapter. It shows or
+     * dismisses a non-cancellable dialog to prevent user interaction according to the value of
+     * [show]. This is only used when the next/previous buttons on the toolbar are clicked; the
+     * other cases are handled with chapter transitions on the viewers and chapter preloading.
+     */
+    private fun setProgressDialog(show: Boolean) {
+        if (show) {
+            viewModel.showLoadingDialog()
+        } else {
+            viewModel.closeDialog()
+        }
+    }
+
+    /**
+     * Moves the viewer to the given page [index]. It does nothing if the viewer is null or the
+     * page is not found.
+     */
+    private fun moveToPageIndex(index: Int) {
+        val viewer = viewModel.state.value.viewer ?: return
+        if (viewer is eu.kanade.tachiyomi.ui.reader.viewer.pager.PagerViewer) {
+            viewer.moveToDisplayPage(index)
+            return
+        }
+        val currentChapter = viewModel.state.value.currentChapter ?: return
+        val page = currentChapter.pages?.getOrNull(index) ?: return
+        viewer.moveToPage(page)
+    }
+
+    /**
+     * Tells the presenter to load the next chapter and mark it as active. The progress dialog
+     * should be automatically shown.
+     */
+    private fun loadNextChapter() {
+        lifecycleScope.launch {
+            viewModel.loadNextChapter()
+            moveToPageIndex(0)
+        }
+    }
+
+    /**
+     * Tells the presenter to load the previous chapter and mark it as active. The progress dialog
+     * should be automatically shown.
+     */
+    private fun loadPreviousChapter() {
+        lifecycleScope.launch {
+            viewModel.loadPreviousChapter()
+            moveToPageIndex(0)
+        }
+    }
+
+    /**
+     * Called from the viewer whenever a [page] is marked as active. It updates the values of the
+     * bottom menu and delegates the change to the presenter.
+     */
+    fun onPageSelected(
+        page: ReaderPage,
+        hasExtraPage: Boolean = false,
+        displayCurrentPage: Int = page.number,
+        displayTotalPages: Int? = null,
+    ) {
+        val selectedKey = page.chapter.chapter.id to page.index
+        if (spatialScenePageKey != null && spatialScenePageKey != selectedKey) {
+            hideSpatialScene()
+        }
+        viewModel.onPageSelected(page, hasExtraPage, displayCurrentPage, displayTotalPages)
+    }
+
+    private fun toggleSpatialScene() {
+        if (spatialSceneActive || spatialSceneBusy) {
+            hideSpatialScene()
+            return
+        }
+        val state = viewModel.state.value
+        val pager = state.viewer as? PagerViewer
+        val page = pager?.getCurrentReaderPage()
+        if (page == null || state.hasExtraPage) {
+            menuToggleToast?.cancel()
+            menuToggleToast = toast(MR.strings.reader_spatial_scene_single_page_only)
+            return
+        }
+
+        spatialSceneBusy = true
+        spatialScenePageKey = page.chapter.chapter.id to page.index
+        menuToggleToast?.cancel()
+        menuToggleToast = toast(MR.strings.reader_spatial_scene_loading)
+        spatialSceneJob = lifecycleScope.launch {
+            try {
+                when (
+                    val result = spatialPipeline.create(page) { htpArchitecture ->
+                        spatialModelCompileHtpVersion = htpArchitecture
+                        spatialModelCompiling = true
+                    }
+                ) {
+                    is DepthSpatialPipeline.Result.Ready -> {
+                        val scene = runCatching {
+                            withContext(Dispatchers.IO) { SpatialDepthSceneIO.read(result.file) }
+                        }.getOrElse { error ->
+                            spatialSceneBusy = false
+                            spatialScenePageKey = null
+                            menuToggleToast = toast(
+                                stringResource(MR.strings.reader_spatial_scene_failed, error.message.orEmpty()),
+                            )
+                            return@launch
+                        }
+                        if (spatialScenePageKey != (page.chapter.chapter.id to page.index)) return@launch
+                        val sceneView = SpatialSceneView(this@ReaderActivity).apply {
+                            showScene(scene)
+                            setMotionSensitivity(spatialMotionSensitivity)
+                            setDepthStrength(spatialDepthStrength)
+                            setRotationAngles(
+                                spatialRotationAngleX,
+                                spatialRotationAngleY,
+                                spatialRotationAngleZ,
+                            )
+                            setOnClickListener { toggleMenu() }
+                        }
+                        val sceneContainer = FrameLayout(this@ReaderActivity).apply {
+                            addView(sceneView, MATCH_PARENT, MATCH_PARENT)
+                        }
+                        val controls = SpatialSceneControlsView(this@ReaderActivity).apply {
+                            configure(
+                                sensitivity = spatialMotionSensitivity,
+                                depthStrength = spatialDepthStrength,
+                                rotationAngleX = spatialRotationAngleX,
+                                rotationAngleY = spatialRotationAngleY,
+                                rotationAngleZ = spatialRotationAngleZ,
+                                anchorText = stringResource(MR.strings.reader_spatial_rotation_anchor),
+                                anchorPickText = stringResource(MR.strings.reader_spatial_rotation_anchor_pick),
+                                sensitivityText = { value ->
+                                    stringResource(
+                                        MR.strings.reader_spatial_gyro_sensitivity,
+                                        String.format(Locale.getDefault(), "%.1f", value),
+                                    )
+                                },
+                                depthText = { value ->
+                                    stringResource(
+                                        MR.strings.reader_spatial_depth_strength,
+                                        String.format(Locale.getDefault(), "%.1f", value),
+                                    )
+                                },
+                                rotationText = { axis, value ->
+                                    stringResource(
+                                        MR.strings.reader_spatial_rotation_angle,
+                                        axis,
+                                        String.format(Locale.getDefault(), "%.1f", value),
+                                    )
+                                },
+                                rotationButtonText = stringResource(MR.strings.reader_spatial_rotation_angles),
+                                rotationResetText = stringResource(MR.strings.reader_spatial_rotation_reset),
+                                gyroResetText = stringResource(MR.strings.reader_spatial_gyro_reset),
+                                onAnchorRequested = {
+                                    sceneView.beginRotationAnchorSelection {
+                                        completeAnchorSelection()
+                                        menuToggleToast?.cancel()
+                                        menuToggleToast = toast(MR.strings.reader_spatial_rotation_anchor_set)
+                                    }
+                                },
+                                onGyroscopeReset = {
+                                    sceneView.resetGyroscope()
+                                    menuToggleToast?.cancel()
+                                    menuToggleToast = toast(MR.strings.reader_spatial_gyro_reset_done)
+                                },
+                                onSensitivityChanged = { sensitivity ->
+                                    spatialMotionSensitivity = sensitivity
+                                    sceneView.setMotionSensitivity(sensitivity)
+                                },
+                                onDepthStrengthChanged = { strength ->
+                                    spatialDepthStrength = strength
+                                    sceneView.setDepthStrength(strength)
+                                },
+                                onRotationAnglesChanged = { xDegrees, yDegrees, zDegrees ->
+                                    spatialRotationAngleX = xDegrees
+                                    spatialRotationAngleY = yDegrees
+                                    spatialRotationAngleZ = zDegrees
+                                    sceneView.setRotationAngles(xDegrees, yDegrees, zDegrees)
+                                },
+                            )
+                        }
+                        val controlMargin = (16 * resources.displayMetrics.density + 0.5f).toInt()
+                        binding.root.addView(
+                            controls,
+                            FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.END or Gravity.BOTTOM).apply {
+                                marginEnd = controlMargin
+                                bottomMargin = controlMargin
+                            },
+                        )
+                        ViewCompat.setOnApplyWindowInsetsListener(controls) { view, insets ->
+                            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+                            (view.layoutParams as? FrameLayout.LayoutParams)?.let { params ->
+                                params.marginEnd = controlMargin + systemBars.right
+                                params.bottomMargin = controlMargin + systemBars.bottom
+                                view.layoutParams = params
+                            }
+                            insets
+                        }
+                        binding.viewerContainer.addView(sceneContainer, MATCH_PARENT, MATCH_PARENT)
+                        sceneView.startMotion()
+                        spatialSceneView = sceneView
+                        spatialSceneContainer = sceneContainer
+                        spatialSceneControls = controls
+                        spatialSceneActive = true
+                    }
+                    DepthSpatialPipeline.Result.ModelMissing -> {
+                        showSpatialModelDownloadDialog = true
+                        spatialScenePageKey = null
+                    }
+                    DepthSpatialPipeline.Result.RuntimeUnavailable -> {
+                        menuToggleToast = toast(MR.strings.reader_spatial_scene_runtime_unavailable)
+                        spatialScenePageKey = null
+                    }
+                    is DepthSpatialPipeline.Result.Failed -> {
+                        menuToggleToast = toast(
+                            stringResource(
+                                MR.strings.reader_spatial_scene_failed,
+                                result.cause.message.orEmpty(),
+                            ),
+                        )
+                        spatialScenePageKey = null
+                    }
+                }
+            } finally {
+                spatialModelCompiling = false
+                spatialModelCompileHtpVersion = null
+                spatialSceneBusy = false
+                spatialSceneJob = null
+            }
+        }
+    }
+
+    private fun hideSpatialScene() {
+        spatialSceneJob?.cancel()
+        spatialSceneJob = null
+        spatialModelCompiling = false
+        spatialModelCompileHtpVersion = null
+        spatialSceneBusy = false
+        spatialScenePageKey = null
+        spatialSceneView?.let { view ->
+            view.release()
+        }
+        spatialSceneContainer?.let(binding.viewerContainer::removeView)
+        spatialSceneControls?.let(binding.root::removeView)
+        spatialSceneView = null
+        spatialSceneContainer = null
+        spatialSceneControls = null
+        spatialSceneActive = false
+    }
+
+    private fun downloadSpatialModel() {
+        if (spatialModelDownloadProgress != null) return
+        spatialModelDownloadProgress = 0
+        lifecycleScope.launch {
+            runCatching {
+                spatialModel.download { downloaded, total ->
+                    spatialModelDownloadProgress = if (total > 0L) {
+                        (downloaded * 100L / total).toInt().coerceIn(0, 100)
+                    } else {
+                        0
+                    }
+                }
+            }.onSuccess {
+                spatialModelDownloadProgress = null
+                showSpatialModelDownloadDialog = false
+                toggleSpatialScene()
+            }.onFailure { error ->
+                spatialModelDownloadProgress = null
+                showSpatialModelDownloadDialog = false
+                menuToggleToast = toast(
+                    stringResource(
+                        MR.strings.reader_spatial_scene_download_failed,
+                        error.message.orEmpty(),
+                    ),
+                )
+            }
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        logcat {
+            "ReaderActivity.onConfigurationChanged: orientation=${newConfig.orientation}, " +
+                "currentPage=${viewModel.state.value.currentPage}, totalPages=${viewModel.state.value.totalPages}"
+        }
+        persistCurrentPagerPage()
+        super.onConfigurationChanged(newConfig)
+        (viewModel.state.value.viewer as? eu.kanade.tachiyomi.ui.reader.viewer.pager.PagerViewer)
+            ?.refreshAutomaticPageLayout()
+    }
+
+    private fun persistCurrentPagerPage() {
+        val page = (viewModel.state.value.viewer as? eu.kanade.tachiyomi.ui.reader.viewer.pager.PagerViewer)
+            ?.getCurrentReaderPage()
+            ?: return
+        logcat {
+            "ReaderActivity.persistCurrentPagerPage: page=${page.number}, index=${page.index}, " +
+                "chapter=${page.chapter.chapter.id}"
+        }
+        viewModel.saveCurrentPageForRestore(page)
+    }
+
+    /**
+     * Called from the viewer whenever a [page] is long clicked. A bottom sheet with a list of
+     * actions to perform is shown.
+     */
+    fun onPageLongTap(page: ReaderPage) {
+        viewModel.openPageDialog(page)
+    }
+
+    /**
+     * Called from the viewer when the given [chapter] should be preloaded. It should be called when
+     * the viewer is reaching the beginning or end of a chapter or the transition page is active.
+     */
+    fun requestPreloadChapter(chapter: ReaderChapter) {
+        lifecycleScope.launch(Dispatchers.IO) { viewModel.preload(chapter) }
+    }
+
+    /**
+     * Called from the viewer to toggle the visibility of the menu. It's implemented on the
+     * viewer because each one implements its own touch and key events.
+     */
+    fun toggleMenu() {
+        setMenuVisibility(!viewModel.state.value.menuVisible)
+    }
+
+    /**
+     * Called from the viewer to show the menu.
+     */
+    fun showMenu() {
+        if (!viewModel.state.value.menuVisible) {
+            setMenuVisibility(true)
+        }
+    }
+
+    /**
+     * Called from the viewer to hide the menu.
+     */
+    fun hideMenu() {
+        if (viewModel.state.value.menuVisible) {
+            setMenuVisibility(false)
+        }
+    }
+
+    /**
+     * Called from the presenter when a page is ready to be shared. It shows Android's default
+     * sharing tool.
+     */
+    private fun onShareImageResult(uri: Uri, page: ReaderPage) {
+        val manga = viewModel.manga ?: return
+        val chapter = page.chapter.chapter
+
+        val intent = uri.toShareIntent(
+            context = applicationContext,
+            message = stringResource(MR.strings.share_page_info, manga.title, chapter.name, page.number),
+        )
+        startActivity(intent)
+    }
+
+    private fun onCopyImageResult(uri: Uri) {
+        val clipboardManager = applicationContext.getSystemService<ClipboardManager>() ?: return
+        val clipData = ClipData.newUri(applicationContext.contentResolver, "", uri)
+        clipboardManager.setPrimaryClip(clipData)
+    }
+
+    /**
+     * Called from the presenter when a page is saved or fails. It shows a message or logs the
+     * event depending on the [result].
+     */
+    private fun onSaveImageResult(result: ReaderViewModel.SaveImageResult) {
+        when (result) {
+            is ReaderViewModel.SaveImageResult.Success -> {
+                toast(MR.strings.picture_saved)
+            }
+            is ReaderViewModel.SaveImageResult.Error -> {
+                logcat(LogPriority.ERROR, result.error)
+            }
+        }
+    }
+
+    /**
+     * Called from the presenter when a page is set as cover or fails. It shows a different message
+     * depending on the [result].
+     */
+    private fun onSetAsCoverResult(result: ReaderViewModel.SetAsCoverResult) {
+        toast(
+            when (result) {
+                Success -> MR.strings.cover_updated
+                AddToLibraryFirst -> MR.strings.notification_first_add_to_library
+                Error -> MR.strings.notification_cover_update_failed
+            },
+        )
+    }
+
+    /**
+     * Forces the user preferred [orientation] on the activity.
+     */
+    private fun setOrientation(orientation: Int) {
+        val newOrientation = ReaderOrientation.fromPreference(orientation)
+        if (newOrientation.flag != requestedOrientation) {
+            requestedOrientation = newOrientation.flag
+        }
+    }
+
+    /**
+     * Updates viewer inset depending on fullscreen reader preferences.
+     */
+    private fun updateViewerInset(fullscreen: Boolean, drawUnderCutout: Boolean) {
+        if (!::binding.isInitialized) return
+        val view = binding.viewerContainer
+
+        view.applyInsetsPadding(ViewCompat.getRootWindowInsets(view), fullscreen, drawUnderCutout)
+        ViewCompat.setOnApplyWindowInsetsListener(view) { view, windowInsets ->
+            view.applyInsetsPadding(windowInsets, fullscreen, drawUnderCutout)
+            windowInsets
+        }
+    }
+
+    private fun View.applyInsetsPadding(
+        windowInsets: WindowInsetsCompat?,
+        fullscreen: Boolean,
+        drawUnderCutout: Boolean,
+    ) {
+        val insets = when {
+            !fullscreen -> windowInsets?.getInsets(WindowInsetsCompat.Type.systemBars())
+            !drawUnderCutout -> windowInsets?.getInsets(WindowInsetsCompat.Type.displayCutout())
+            else -> null
+        }
+            ?: Insets.NONE
+
+        setPadding(insets.left, insets.top, insets.right, insets.bottom)
+    }
+
+    /**
+     * Class that handles the user preferences of the reader.
+     */
+    private inner class ReaderConfig {
+
+        private fun getCombinedPaint(grayscale: Boolean, invertedColors: Boolean): Paint {
+            return Paint().apply {
+                colorFilter = ColorMatrixColorFilter(
+                    ColorMatrix().apply {
+                        if (grayscale) {
+                            setSaturation(0f)
+                        }
+                        if (invertedColors) {
+                            postConcat(
+                                ColorMatrix(
+                                    floatArrayOf(
+                                        -1f, 0f, 0f, 0f, 255f,
+                                        0f, -1f, 0f, 0f, 255f,
+                                        0f, 0f, -1f, 0f, 255f,
+                                        0f, 0f, 0f, 1f, 0f,
+                                    ),
+                                ),
+                            )
+                        }
+                    },
+                )
+            }
+        }
+
+        /*
+         * Initializes the reader subscriptions.
+         */
+        init {
+            readerPreferences.readerTheme.changes()
+                .onEach { theme ->
+                    binding.readerContainer.setBackgroundColor(baseContext.readerBackgroundColor(theme))
+                }
+                .launchIn(lifecycleScope)
+
+            readerPreferences.keepScreenOn.changes()
+                .onEach(::setKeepScreenOn)
+                .launchIn(lifecycleScope)
+
+            readerPreferences.customBrightness.changes()
+                .onEach(::setCustomBrightness)
+                .launchIn(lifecycleScope)
+
+            combine(
+                readerPreferences.grayscale.changes(),
+                readerPreferences.invertedColors.changes(),
+            ) { grayscale, invertedColors -> grayscale to invertedColors }
+                .onEach { (grayscale, invertedColors) ->
+                    setLayerPaint(grayscale, invertedColors)
+                }
+                .launchIn(lifecycleScope)
+
+            combine(
+                readerPreferences.fullscreen.changes(),
+                readerPreferences.drawUnderCutout.changes(),
+            ) { fullscreen, drawUnderCutout -> fullscreen to drawUnderCutout }
+                .onEach { (fullscreen, drawUnderCutout) ->
+                    updateViewerInset(fullscreen, drawUnderCutout)
+                }
+                .launchIn(lifecycleScope)
+        }
+
+        /**
+         * Sets the keep screen on mode according to [enabled].
+         */
+        private fun setKeepScreenOn(enabled: Boolean) {
+            if (enabled) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+
+        /**
+         * Sets the custom brightness overlay according to [enabled].
+         */
+        private fun setCustomBrightness(enabled: Boolean) {
+            if (enabled) {
+                readerPreferences.customBrightnessValue.changes()
+                    .sample(0.1.seconds)
+                    .onEach(::setCustomBrightnessValue)
+                    .launchIn(lifecycleScope)
+            } else {
+                setCustomBrightnessValue(0)
+            }
+        }
+
+        /**
+         * Sets the brightness of the screen. Range is [-75, 100].
+         * From -75 to -1 a semi-transparent black view is overlaid with the minimum brightness.
+         * From 1 to 100 it sets that value as brightness.
+         * 0 sets system brightness and hides the overlay.
+         */
+        private fun setCustomBrightnessValue(value: Int) {
+            // Calculate and set reader brightness.
+            val readerBrightness = when {
+                value > 0 -> {
+                    value / 100f
+                }
+                value < 0 -> {
+                    0.01f
+                }
+                else -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            }
+            window.attributes = window.attributes.apply { screenBrightness = readerBrightness }
+
+            viewModel.setBrightnessOverlayValue(value)
+        }
+        private fun setLayerPaint(grayscale: Boolean, invertedColors: Boolean) {
+            val paint = if (grayscale || invertedColors) getCombinedPaint(grayscale, invertedColors) else null
+            binding.viewerContainer.setLayerType(LAYER_TYPE_HARDWARE, paint)
+        }
+    }
+}
