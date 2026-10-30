@@ -1,0 +1,70 @@
+#!/bin/sh
+
+set -eu
+
+: "${ONNX_DIR:?Set ONNX_DIR to the directory containing exported ONNX models}"
+: "${OUTPUT_DIR:?Set OUTPUT_DIR to the QNN converter output directory}"
+
+MANGA_CALIBRATION_INPUT_LIST=${MANGA_CALIBRATION_INPUT_LIST:-${CALIBRATION_INPUT_LIST:-}}
+PHOTO_CALIBRATION_INPUT_LIST=${PHOTO_CALIBRATION_INPUT_LIST:-${CALIBRATION_INPUT_LIST:-}}
+
+QNN_SDK_ROOT=${QNN_SDK_ROOT:-/qnn}
+CONVERTER="$QNN_SDK_ROOT/bin/x86_64-linux-clang/qnn-onnx-converter"
+
+mkdir -p "$OUTPUT_DIR"
+
+models=${QNN_MODELS:-"\
+    realesrgan-animevideov3-x2 \
+    realesrgan-general-x4v3-x2 \
+    realcugan-se-x2-no-denoise \
+    realcugan-se-x2-denoise1x \
+    realcugan-se-x2-denoise2x \
+    realcugan-se-x2-denoise3x \
+    realcugan-se-x2-conservative \
+    realcugan-pro-x2-no-denoise \
+    realcugan-pro-x2-denoise3x \
+    realcugan-pro-x2-conservative \
+    realcugan-pro-x3-no-denoise \
+    realcugan-pro-x3-denoise3x \
+    realcugan-pro-x3-conservative \
+    span-nomosuni-x2 \
+    w2xex-photo-small-x2"}
+
+for name in $models; do
+    model="$ONNX_DIR/$name.onnx"
+    if [ ! -f "$model" ]; then
+        echo "Missing ONNX model: $model" >&2
+        exit 1
+    fi
+    act_bitwidth=8
+    input_list=$MANGA_CALIBRATION_INPUT_LIST
+    case "$name" in
+        realesrgan-general-x4v3-x2|span-nomosuni-x2|w2xex-photo-small-x2)
+            input_list=$PHOTO_CALIBRATION_INPUT_LIST
+            ;;
+    esac
+    if [ -z "$input_list" ] || [ ! -f "$input_list" ]; then
+        echo "Missing calibration list for $name; set MANGA_CALIBRATION_INPUT_LIST or PHOTO_CALIBRATION_INPUT_LIST (or CALIBRATION_INPUT_LIST for a shared dataset)" >&2
+        exit 1
+    fi
+    case "$name" in
+        realesrgan-general-x4v3-x2|realcugan-se-*|realcugan-pro-*|span-nomosuni-x2|w2xex-photo-small-x2)
+            # Photo-oriented models accumulate visible artifacts with 8-bit activations.
+            # Keep 8-bit weights but use 16-bit activations for image quality.
+            act_bitwidth=16
+            ;;
+    esac
+    "$CONVERTER" \
+        --input_network "$model" \
+        --input_layout input NCHW \
+        --input_encoding input rgb rgb \
+        --float_bitwidth 16 \
+        --exclude_named_tensors \
+        --input_list "$input_list" \
+        --act_bitwidth "$act_bitwidth" \
+        --weights_bitwidth 8 \
+        --bias_bitwidth 32 \
+        --use_per_channel_quantization \
+        --algorithms cle \
+        --output_path "$OUTPUT_DIR/$name-int8.cpp"
+done

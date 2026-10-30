@@ -1,0 +1,36 @@
+* text=auto
+* text eol=lf
+
+# Windows forced line-endings
+/.idea/* text eol=crlf
+
+# Gradle wrapper
+*.jar binary
+*.a binary
+*.bin binary
+
+# Images
+*.webp binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.zip binary
+*.7z binary
+*.ttf binary
+*.eot binary
+*.woff binary
+*.pyc binary
+*.swp binary
+
+# Native libraries, model and signing assets (carried over from the Hiyori baseline)
+*.so binary
+*.param binary
+*.jks binary
+*.avif binary
+*.dlc binary
+*.tflite binary
+*.task binary
+*.onnx binary

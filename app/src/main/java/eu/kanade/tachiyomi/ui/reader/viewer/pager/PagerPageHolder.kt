@@ -1,0 +1,1196 @@
+@file:Suppress("ktlint:standard:max-line-length")
+
+package eu.kanade.tachiyomi.ui.reader.viewer.pager
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.drawable.Drawable
+import android.view.LayoutInflater
+import androidx.core.graphics.applyCanvas
+import androidx.core.graphics.createBitmap
+import androidx.core.view.doOnLayout
+import androidx.core.view.isVisible
+import eu.kanade.presentation.util.formattedMessage
+import eu.kanade.tachiyomi.databinding.ReaderErrorBinding
+import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.ui.reader.model.InsertPage
+import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
+import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
+import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
+import eu.kanade.tachiyomi.ui.webview.WebViewActivity
+import eu.kanade.tachiyomi.util.system.dpToPx
+import eu.kanade.tachiyomi.util.system.isNightMode
+import eu.kanade.tachiyomi.util.waifu2x.EnhancementStatusBus
+import eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache
+import eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer
+import eu.kanade.tachiyomi.util.waifu2x.PageEnhanceState
+import eu.kanade.tachiyomi.widget.ViewPagerAdapter
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import logcat.LogPriority
+import okio.Buffer
+import okio.BufferedSource
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.core.common.util.lang.launchIO
+import tachiyomi.core.common.util.lang.withIOContext
+import tachiyomi.core.common.util.lang.withUIContext
+import tachiyomi.core.common.util.system.ImageUtil
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.i18n.MR
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+import kotlin.coroutines.resume
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * View of the ViewPager that contains a page of a chapter.
+ */
+@SuppressLint("ViewConstructor")
+class PagerPageHolder(
+    readerThemedContext: Context,
+    val viewer: PagerViewer,
+    val page: ReaderPage,
+    private var extraPage: ReaderPage? = null,
+) : ReaderPageImageView(readerThemedContext), ViewPagerAdapter.PositionableView {
+
+    private data class RenderedPage(
+        val source: BufferedSource,
+        val isAnimated: Boolean,
+        val background: Drawable?,
+        val splitPages: Set<ReaderPage>,
+        /** Enhanced cache entry this frame was decoded from, if any. */
+        val enhancedFile: java.io.File? = null,
+    )
+
+    /**
+     * Item that identifies this view. Needed by the adapter to not recreate views.
+     */
+    override val item
+        get() = page to extraPage
+
+    /**
+     * Loading progress bar to indicate the current progress.
+     */
+    private var progressIndicator: ReaderProgressIndicator? = null // = ReaderProgressIndicator(readerThemedContext)
+
+    /**
+     * Error layout to show when the image fails to load.
+     */
+    private var errorLayout: ReaderErrorBinding? = null
+
+    private val extraScope = MainScope()
+
+    private val scope = MainScope()
+
+    /**
+     * Job for loading the page and processing changes to its status.
+     */
+    private var loadJob: Job? = null
+
+    /**
+     * Job for loading the extra page and processing changes to its status.
+     */
+    private var extraLoadJob: Job? = null
+    private var extraEnhancementWatchJob: Job? = null
+    private var extraEnhancementState: String? = null
+    private var halfStatusJob: Job? = null
+    private var pageSpreadRetryJob: Job? = null
+    private var hasReceivedSelection = false
+
+    private val readerPreferences by lazy { Injekt.get<ReaderPreferences>() }
+
+    init {
+        // Set page index for enhancement priority tracking
+        pageIndex = page.index
+        mangaId = viewer.activity.viewModel.manga?.id ?: -1L
+        chapterId = page.chapter.chapter.id ?: -1L
+        refreshEnhancementTargets()
+        readerPage = page
+        val pageInset = viewer.config.verticalPaddingDp.dpToPx
+        setPadding(pageInset, pageInset, pageInset, pageInset)
+        enhancementStatusPublisher = extraPage == null
+        originalImageSourceFactory = { buildOriginalDisplaySource() }
+        if (usesEnhancedDisplayTransform()) {
+            enhancedImageSourceFactory = { buildEnhancedDisplaySource(it) }
+        }
+        loadJob = scope.launch { loadPageAndProcessStatus() }
+    }
+
+    /**
+     * Called when this view is detached from the window. Unsubscribes any active subscription.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        loadJob?.cancel()
+        loadJob = null
+        extraLoadJob?.cancel()
+        extraLoadJob = null
+        extraEnhancementWatchJob?.cancel()
+        extraEnhancementWatchJob = null
+        halfStatusJob?.cancel()
+        halfStatusJob = null
+        pageSpreadRetryJob?.cancel()
+        pageSpreadRetryJob = null
+        // Region decoders own native allocations that otherwise wait for finalization.
+        recycle()
+    }
+
+    private fun initProgressIndicator() {
+        if (progressIndicator == null) {
+            progressIndicator = ReaderProgressIndicator(context)
+            addView(progressIndicator)
+        }
+    }
+
+    /**
+     * Loads the page and processes changes to the page's status.
+     *
+     * Returns immediately if the page has no PageLoader.
+     * Otherwise, this function does not return. It will continue to process status changes until
+     * the Job is cancelled.
+     */
+    private suspend fun loadPageAndProcessStatus() {
+        val loader = page.chapter.pageLoader ?: return
+
+        supervisorScope {
+            launch(Dispatchers.IO) {
+                loader.loadPage(page)
+            }
+            extraPage?.let { extraPage ->
+                extraLoadJob = extraScope.launch {
+                    launchIO {
+                        loader.loadPage(extraPage)
+                    }
+                }
+            }
+
+            val statusFlow = if (extraPage == null) {
+                page.statusFlow
+            } else {
+                kotlinx.coroutines.flow.combine(page.statusFlow, extraPage!!.statusFlow) { s1, s2 -> s1 to s2 }
+            }
+
+            statusFlow.collectLatest { pairOrStatus ->
+                val (s1, s2) = if (pairOrStatus is Pair<*, *>) {
+                    pairOrStatus.first as Page.State to pairOrStatus.second as Page.State
+                } else {
+                    pairOrStatus as Page.State to Page.State.Ready
+                }
+
+                when {
+                    s1 is Page.State.Error -> setError(s1.error)
+                    s2 is Page.State.Error -> setError(s2.error)
+                    s1 == Page.State.Queue || s2 == Page.State.Queue -> setQueued()
+                    s1 == Page.State.LoadPage || s2 == Page.State.LoadPage -> setLoading()
+                    s1 == Page.State.DownloadImage || s2 == Page.State.DownloadImage -> {
+                        setDownloading()
+                        // TODO: Implement progress combining if needed
+                    }
+                    s1 == Page.State.Ready && s2 == Page.State.Ready -> setImage()
+                }
+            }
+        }
+    }
+
+    /**
+     * Called when the page is queued.
+     */
+    private fun setQueued() {
+        initProgressIndicator()
+        progressIndicator?.show()
+        removeErrorLayout()
+    }
+
+    /**
+     * Called when the page is loading.
+     */
+    private fun setLoading() {
+        initProgressIndicator()
+        progressIndicator?.show()
+        removeErrorLayout()
+    }
+
+    /**
+     * Called when the page is downloading.
+     */
+    private fun setDownloading() {
+        initProgressIndicator()
+        progressIndicator?.show()
+        removeErrorLayout()
+    }
+
+    /**
+     * Called when the page is ready.
+     */
+    private suspend fun setImage() {
+        progressIndicator?.setProgress(0)
+        refreshEnhancementTargets()
+        awaitCombinedPageLayoutIfNeeded()
+
+        val streamFn = page.stream ?: return
+        val streamFn2 = extraPage?.stream
+
+        try {
+            val renderedPage = withIOContext {
+                val splitPages = mutableSetOf<ReaderPage>()
+                val enhancedFile = currentEnhancedFile(page)
+                val source = currentDisplayStream(page, enhancedFile)?.use { s1 ->
+                    val primarySource = Buffer().readFrom(s1)
+                    if (extraPage != null) {
+                        currentDisplayStream(extraPage!!)?.use { s2 ->
+                            mergeOrSplitPages(
+                                pageSourceForCombinedDisplay(page, primarySource),
+                                pageSourceForCombinedDisplay(extraPage!!, Buffer().readFrom(s2)),
+                            )
+                        }
+                    } else {
+                        splitPages += detectPageSpread(primarySource)
+                        if (requiresSplitBeforeSpreadDetection(page, primarySource)) {
+                            splitPages += page
+                        }
+                        process(item, primarySource)
+                    }
+                }!!
+                val isAnimated = ImageUtil.isAnimatedAndSupported(source)
+                val background = if (!isAnimated && viewer.config.automaticBackground) {
+                    ImageUtil.chooseBackground(context, source.peek().inputStream())
+                } else {
+                    null
+                }
+                RenderedPage(source, isAnimated, background, splitPages, enhancedFile)
+            }
+            withContext(Dispatchers.Main) {
+                setImage(
+                    renderedPage.source,
+                    renderedPage.isAnimated,
+                    Config(
+                        zoomDuration = viewer.config.doubleTapAnimDuration,
+                        minimumScaleType = viewer.config.imageScaleType,
+                        cropBorders = viewer.config.imageCropBorders,
+                        zoomStartPosition = viewer.config.imageZoomType,
+                        landscapeZoom = viewer.config.landscapeZoom,
+                    ),
+                    streamFn.takeUnless { usesTransformedEnhancedDisplay() },
+                    renderedPage.enhancedFile,
+                )
+                if (!renderedPage.isAnimated) {
+                    pageBackground = renderedPage.background
+                }
+                removeErrorLayout()
+                startExtraEnhancementWatcherIfNeeded()
+                startHalfStatusWatcherIfNeeded()
+                // The current half is now visible. Inserting its sibling before this point can
+                // detach this holder and cancel its image load, which briefly shows a black page.
+                insertSplitPagesAfterDisplay(renderedPage.splitPages)
+            }
+        } catch (_: CancellationException) {
+            return
+        } catch (e: Throwable) {
+            logcat(LogPriority.ERROR, e)
+            withContext(Dispatchers.Main) {
+                setError(e)
+            }
+        }
+    }
+
+    private suspend fun awaitCombinedPageLayoutIfNeeded() {
+        if (extraPage == null || hasCombinedViewportSize()) {
+            return
+        }
+
+        suspendCancellableCoroutine { continuation ->
+            doOnLayout {
+                if (continuation.isActive) {
+                    continuation.resume(Unit)
+                }
+            }
+        }
+    }
+
+    private fun hasCombinedViewportSize(): Boolean {
+        return width > 0 && height > 0
+    }
+
+    private fun detectPageSpread(primarySource: BufferedSource): Set<ReaderPage> {
+        val candidate = viewer.getPageSpreadCandidate(page) ?: run {
+            logcat(LogPriority.INFO) {
+                "PageSpread: no candidate for page ${page.index}; auto=${viewer.config.autoDetectPageSpreads}, double=${viewer.config.doublePages}"
+            }
+            return emptySet()
+        }
+        logcat(LogPriority.INFO) {
+            "PageSpread: checking pages ${candidate.first.index} and ${candidate.second.index}"
+        }
+        if (requiresSplitBeforeSpreadDetection(page, primarySource)) {
+            logcat(LogPriority.INFO) { "PageSpread: deferring page ${page.index} until its wide source is split" }
+            viewer.onPageSpreadDeferred(candidate)
+            return setOf(page)
+        }
+
+        val adjacentPage = if (candidate.first === page) candidate.second else candidate.first
+        val adjacentSource = currentDisplayStream(adjacentPage)?.use { Buffer().readFrom(it) }
+        if (adjacentSource == null) {
+            logcat(LogPriority.INFO) {
+                "PageSpread: waiting for adjacent page ${adjacentPage.index}; state=${adjacentPage.status}"
+            }
+            deferPageSpreadUntilAdjacentIsReady(candidate, adjacentPage)
+            return emptySet()
+        }
+
+        if (requiresSplitBeforeSpreadDetection(adjacentPage, adjacentSource)) {
+            logcat(LogPriority.INFO) { "PageSpread: deferring until adjacent wide page ${adjacentPage.index} is split" }
+            viewer.onPageSpreadDeferred(candidate)
+            return setOf(adjacentPage)
+        }
+
+        val firstSource = if (candidate.first === page) primarySource else adjacentSource
+        val secondSource = if (candidate.second === page) primarySource else adjacentSource
+        val result = PageSpreadDetector.detect(
+            firstSource = pageSourceForCombinedDisplay(candidate.first, firstSource),
+            secondSource = pageSourceForCombinedDisplay(candidate.second, secondSource),
+            isR2L = viewer is R2LPagerViewer,
+        )
+        logcat(LogPriority.INFO) {
+            "PageSpread: pages ${candidate.first.index}/${candidate.second.index} confidence=${result.confidence}, detected=${result.isSpread}, " +
+                "blocks=${result.matchingBlocks}/${result.informativeBlocks}/${result.totalBlocks}, bands=${result.matchingBands}, " +
+                "spatial=${result.spatialMatchingBlocks}"
+        }
+        viewer.onPageSpreadChecked(candidate, result.isSpread)
+        return emptySet()
+    }
+
+    private fun deferPageSpreadUntilAdjacentIsReady(
+        candidate: PagerViewerAdapter.PageSpreadCandidate,
+        adjacentPage: ReaderPage,
+    ) {
+        viewer.onPageSpreadDeferred(candidate)
+        if (pageSpreadRetryJob?.isActive == true) return
+
+        pageSpreadRetryJob = scope.launch {
+            adjacentPage.statusFlow.first { it == Page.State.Ready }
+            logcat(LogPriority.INFO) { "PageSpread: adjacent page ${adjacentPage.index} is ready; retrying" }
+            // Release this retry before checking again so a transient stream failure can defer a
+            // new retry instead of being treated as an already-active job.
+            pageSpreadRetryJob = null
+            withIOContext {
+                currentDisplayStream(page)?.use { source ->
+                    val splitPages = detectPageSpread(Buffer().readFrom(source))
+                    withUIContext {
+                        insertSplitPagesAfterDisplay(splitPages)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun requiresSplitBeforeSpreadDetection(targetPage: ReaderPage, source: BufferedSource): Boolean {
+        return targetPage !is InsertPage &&
+            !viewer.hasSplitPage(targetPage) &&
+            shouldSplitWidePagesInSinglePageMode() &&
+            isWideImage(source)
+    }
+
+    private fun pageSourceForCombinedDisplay(targetPage: ReaderPage, source: BufferedSource): BufferedSource {
+        return if (shouldSplitWidePagesInSinglePageMode() && isWideImage(source)) {
+            ImageUtil.splitInHalf(source.peek(), splitSideFor(targetPage))
+        } else {
+            source
+        }
+    }
+
+    private fun usesTransformedEnhancedDisplay(): Boolean {
+        return extraPage != null || viewer.config.dualPageRotateToFit
+    }
+
+    private fun usesEnhancedDisplayTransform(): Boolean {
+        return usesTransformedEnhancedDisplay() || shouldSplitWidePagesInSinglePageMode()
+    }
+
+    private fun shouldSplitWidePagesInSinglePageMode(): Boolean {
+        return !viewer.config.doublePages && viewer.config.autoSplitPages
+    }
+
+    private fun insertSplitPagesAfterDisplay(pages: Set<ReaderPage>) {
+        if (!shouldSplitWidePagesInSinglePageMode()) return
+
+        pages.forEach { targetPage ->
+            if (targetPage !is InsertPage && !viewer.hasSplitPage(targetPage)) {
+                onPageSplit(targetPage)
+            }
+        }
+    }
+
+    private fun refreshEnhancementTargets() {
+        enhancementVariantOverride = enhancementVariantFor(page)
+        enhancementStreamOverride = enhancementStreamFor(page)
+    }
+
+    private fun enhancementVariantFor(targetPage: ReaderPage): String {
+        val baseVariant = targetPage.enhancementKeySuffix
+        if (!usesConfirmedSplitSource(targetPage)) {
+            return baseVariant
+        }
+
+        val halfVariant = when (splitSideFor(targetPage)) {
+            ImageUtil.Side.LEFT -> "wide_left"
+            ImageUtil.Side.RIGHT -> "wide_right"
+        }
+        return if (baseVariant.isBlank()) {
+            halfVariant
+        } else {
+            "${baseVariant}__$halfVariant"
+        }
+    }
+
+    private fun enhancementStreamFor(targetPage: ReaderPage): (() -> java.io.InputStream)? {
+        return if (usesConfirmedSplitSource(targetPage)) {
+            buildSplitEnhancementStream(targetPage)
+        } else {
+            null
+        }
+    }
+
+    private fun usesConfirmedSplitSource(targetPage: ReaderPage): Boolean {
+        return shouldSplitWidePagesInSinglePageMode() &&
+            (targetPage is InsertPage || viewer.hasSplitPage(targetPage))
+    }
+
+    private fun buildSplitEnhancementStream(targetPage: ReaderPage): (() -> java.io.InputStream)? {
+        return {
+            val originalStream = targetPage.enhancementStream ?: targetPage.stream
+                ?: error("Missing source stream for split enhancement")
+            val source = Buffer().readFrom(originalStream())
+            if (!usesConfirmedSplitSource(targetPage) || !isWideImage(source)) {
+                source.inputStream()
+            } else {
+                ImageUtil.splitInHalf(source, splitSideFor(targetPage)).inputStream()
+            }
+        }
+    }
+
+    private fun currentDisplayStream(targetPage: ReaderPage, preferredEnhancedFile: java.io.File? = null): java.io.InputStream? {
+        val enhancedFile = preferredEnhancedFile ?: currentEnhancedFile(targetPage)
+        return try {
+            when {
+                enhancedFile != null -> ImageEnhancementCache.readCachedImage(enhancedFile)?.inputStream()
+                    ?: originalDisplayStream(targetPage)
+                shouldUseSplitDisplaySource(targetPage) && enhancementStreamFor(targetPage) != null ->
+                    enhancementStreamFor(targetPage)?.invoke()
+                else -> targetPage.stream?.invoke()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            originalDisplayStream(targetPage)
+        }
+    }
+
+    private fun originalDisplayStream(targetPage: ReaderPage): java.io.InputStream? {
+        return if (shouldUseSplitDisplaySource(targetPage)) {
+            enhancementStreamFor(targetPage)?.invoke() ?: targetPage.stream?.invoke()
+        } else {
+            targetPage.stream?.invoke()
+        }
+    }
+
+    private fun shouldUseSplitDisplaySource(targetPage: ReaderPage): Boolean {
+        return shouldSplitWidePagesInSinglePageMode() &&
+            (targetPage is InsertPage || viewer.hasSplitPage(targetPage))
+    }
+
+    private fun currentEnhancedFile(targetPage: ReaderPage): java.io.File? {
+        if (!readerPreferences.realCuganEnabled().get()) return null
+        // A source page must be inspected at full width once so the pager can create its sibling
+        // half. Using a cached half before that point makes the wide-page detector see a portrait
+        // image and the InsertPage is never added.
+        if (
+            shouldSplitWidePagesInSinglePageMode() &&
+            targetPage !is InsertPage &&
+            !viewer.hasSplitPage(targetPage)
+        ) {
+            return null
+        }
+        val key = enhancementCacheKey(targetPage) ?: return null
+        ImageEnhancementCache.init(context)
+        return ImageEnhancementCache.getCachedImage(
+            key.mangaId,
+            key.chapterId,
+            key.pageIndex,
+            key.configHash,
+            key.pageVariant,
+        )
+    }
+
+    private fun currentEnhancementConfigHash(): String {
+        return ImageEnhancementCache.getConfigHash(readerPreferences)
+    }
+
+    private fun enhancementCacheKey(targetPage: ReaderPage): ImageEnhancementCache.CacheKey? {
+        val mangaId = viewer.activity.viewModel.manga?.id ?: return null
+        val chapterId = targetPage.chapter.chapter.id ?: return null
+        return ImageEnhancementCache.CacheKey(
+            mangaId = mangaId,
+            chapterId = chapterId,
+            pageIndex = targetPage.index,
+            configHash = currentEnhancementConfigHash(),
+            pageVariant = enhancementVariantFor(targetPage),
+        )
+    }
+
+    private fun currentEnhancementState(targetPage: ReaderPage): String {
+        if (!readerPreferences.realCuganEnabled().get()) return "disabled"
+        val key = enhancementCacheKey(targetPage) ?: return "missing-key"
+        ImageEnhancementCache.init(context)
+        return when {
+            ImageEnhancementCache.isSkipped(
+                key.mangaId,
+                key.chapterId,
+                key.pageIndex,
+                key.configHash,
+                key.pageVariant,
+            ) -> "skipped"
+            ImageEnhancementCache.isCached(
+                key.mangaId,
+                key.chapterId,
+                key.pageIndex,
+                key.configHash,
+                key.pageVariant,
+            ) -> "cached"
+            else -> "raw"
+        }
+    }
+
+    private fun buildEnhancedDisplaySource(primaryEnhancedFile: java.io.File): BufferedSource? {
+        val primaryStream = ImageEnhancementCache.readCachedImage(primaryEnhancedFile)?.inputStream() ?: return null
+        return primaryStream.use { s1 ->
+            if (extraPage != null) {
+                val extraStream = currentDisplayStream(extraPage!!) ?: return null
+                extraStream.use { s2 ->
+                    mergeOrSplitPages(
+                        pageSourceForCombinedDisplay(page, Buffer().readFrom(s1)),
+                        pageSourceForCombinedDisplay(extraPage!!, Buffer().readFrom(s2)),
+                    )
+                }
+            } else {
+                process(item, Buffer().readFrom(s1))
+            }
+        }
+    }
+
+    private fun buildOriginalDisplaySource(): BufferedSource? {
+        val primaryStream = originalDisplayStream(page) ?: return null
+        return primaryStream.use { primary ->
+            val source = Buffer().readFrom(primary)
+            val secondaryPage = extraPage
+            if (secondaryPage != null) {
+                val secondaryStream = originalDisplayStream(secondaryPage) ?: return null
+                secondaryStream.use { secondary -> mergeOrSplitPages(source, Buffer().readFrom(secondary)) }
+            } else {
+                process(item, source)
+            }
+        }
+    }
+
+    private fun setTransitionTargetPage(targetPage: ReaderPage?) {
+        if (extraPage == null || targetPage == null) {
+            processedTransitionStartFraction = 0f
+            processedTransitionEndFraction = 1f
+            return
+        }
+
+        val leftPage = if (viewer is R2LPagerViewer) extraPage else page
+        val isLeftHalf = targetPage == leftPage
+        if (isLeftHalf) {
+            processedTransitionStartFraction = 0f
+            processedTransitionEndFraction = 0.5f
+        } else {
+            processedTransitionStartFraction = 0.5f
+            processedTransitionEndFraction = 1f
+        }
+    }
+
+    private suspend fun smoothRefreshCombinedDisplay() {
+        val secondaryPage = extraPage ?: return
+        val rendered = withIOContext {
+            val primaryEnhancedFile = currentEnhancedFile(page)
+            val secondaryEnhancedFile = currentEnhancedFile(secondaryPage)
+            val anchorFile = primaryEnhancedFile ?: secondaryEnhancedFile ?: return@withIOContext null
+
+            val transformedSource =
+                if (primaryEnhancedFile != null) {
+                    buildEnhancedDisplaySource(primaryEnhancedFile)
+                } else {
+                    val primaryStream = currentDisplayStream(page) ?: return@withIOContext null
+                    primaryStream.use { s1 ->
+                        val extraStream = currentDisplayStream(secondaryPage) ?: return@withIOContext null
+                        extraStream.use { s2 ->
+                            mergeOrSplitPages(
+                                pageSourceForCombinedDisplay(page, Buffer().readFrom(s1)),
+                                pageSourceForCombinedDisplay(secondaryPage, Buffer().readFrom(s2)),
+                            )
+                        }
+                    }
+                } ?: return@withIOContext null
+            anchorFile to transformedSource
+        } ?: return
+        withUIContext {
+            setTransitionTargetPage(secondaryPage)
+            setProcessedSource(rendered.first, transformedSource = rendered.second)
+        }
+    }
+
+    private fun startExtraEnhancementWatcherIfNeeded() {
+        val targetPage = extraPage ?: return
+        if (!usesTransformedEnhancedDisplay() || !readerPreferences.realCuganEnabled().get()) return
+
+        if (extraEnhancementWatchJob?.isActive == true) return
+
+        extraEnhancementWatchJob?.cancel()
+        extraEnhancementWatchJob = scope.launch {
+            val key = enhancementCacheKey(targetPage) ?: return@launch
+            extraEnhancementState = withIOContext { currentEnhancementState(targetPage) }
+            ImageEnhancementCache.events.collect { event ->
+                if (!event.affects(key.mangaId, key.chapterId, key.pageIndex, key.configHash, key.pageVariant)) {
+                    return@collect
+                }
+                val newState = cacheStateAfterEvent(event)
+                if (newState != extraEnhancementState) {
+                    val previousState = extraEnhancementState
+                    extraEnhancementState = newState
+                    if (
+                        newState == "cached" &&
+                        previousState != "cached" &&
+                        page.status == Page.State.Ready &&
+                        targetPage.status == Page.State.Ready
+                    ) {
+                        smoothRefreshCombinedDisplay()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startHalfStatusWatcherIfNeeded() {
+        if (extraPage == null) {
+            // Single page: the page view itself is the status publisher.
+            enhancementStatusPublisher = true
+            halfStatusJob?.cancel()
+            halfStatusJob = null
+            return
+        }
+
+        // Dual page: this watcher is the single publisher for both half pages, so the view's
+        // own publishing must not interleave with it.
+        enhancementStatusPublisher = false
+        halfStatusJob?.cancel()
+        halfStatusJob = scope.launch {
+            val leftPage = if (viewer is R2LPagerViewer) extraPage else page
+            val rightPage = if (viewer is R2LPagerViewer) page else extraPage
+            val leftKey = leftPage?.let(::enhancementCacheKey)
+            val rightKey = rightPage?.let(::enhancementCacheKey)
+            var leftState = leftPage?.let { withIOContext { currentEnhancementState(it) } }
+            var rightState = rightPage?.let { withIOContext { currentEnhancementState(it) } }
+
+            launch {
+                ImageEnhancementCache.events.collect { event ->
+                    if (leftKey != null &&
+                        event.affects(
+                            leftKey.mangaId,
+                            leftKey.chapterId,
+                            leftKey.pageIndex,
+                            leftKey.configHash,
+                            leftKey.pageVariant,
+                        )
+                    ) {
+                        leftState = cacheStateAfterEvent(event)
+                    }
+                    if (rightKey != null &&
+                        event.affects(
+                            rightKey.mangaId,
+                            rightKey.chapterId,
+                            rightKey.pageIndex,
+                            rightKey.configHash,
+                            rightKey.pageVariant,
+                        )
+                    ) {
+                        rightState = cacheStateAfterEvent(event)
+                    }
+                }
+            }
+
+            while (isActive) {
+                publishHalfState(leftPage, leftState)
+                publishHalfState(rightPage, rightState)
+                delay(500)
+            }
+        }
+    }
+
+    private fun cacheStateAfterEvent(event: ImageEnhancementCache.CacheEvent): String {
+        return when (event) {
+            is ImageEnhancementCache.CacheEvent.Saved -> "cached"
+            is ImageEnhancementCache.CacheEvent.Skipped -> "skipped"
+            is ImageEnhancementCache.CacheEvent.Removed,
+            ImageEnhancementCache.CacheEvent.Cleared,
+            -> "raw"
+        }
+    }
+
+    private fun publishHalfState(targetPage: ReaderPage?, cacheState: String?) {
+        val state = enhancementState(targetPage, cacheState) ?: return
+        val chapterId = targetPage!!.chapter.chapter.id ?: return
+        EnhancementStatusBus.publish(chapterId, targetPage.index, state)
+    }
+
+    private fun enhancementState(targetPage: ReaderPage?, cacheState: String?): PageEnhanceState? {
+        targetPage ?: return null
+        if (!readerPreferences.realCuganEnabled().get()) return PageEnhanceState.Raw
+
+        val mangaId = viewer.activity.viewModel.manga?.id ?: return null
+        val chapterId = targetPage.chapter.chapter.id ?: return null
+        val pageVariant = enhancementVariantFor(targetPage)
+
+        return when {
+            cacheState == "cached" -> PageEnhanceState.Enhanced
+            cacheState == "skipped" -> PageEnhanceState.Raw
+            ImageEnhancer.isActivelyProcessing(mangaId, chapterId, targetPage.index, pageVariant) -> {
+                val rawProgress = eu.kanade.tachiyomi.util.waifu2x.Waifu2x.getProgressPercent()
+                if (rawProgress in 0..100) {
+                    PageEnhanceState.Processing(PageEnhanceState.Processing.Phase.ENHANCING, rawProgress)
+                } else {
+                    PageEnhanceState.Processing(PageEnhanceState.Processing.Phase.ENHANCING)
+                }
+            }
+            ImageEnhancer.hasRequest(mangaId, chapterId, targetPage.index, pageVariant) ->
+                PageEnhanceState.Processing(PageEnhanceState.Processing.Phase.QUEUED)
+            else -> PageEnhanceState.Raw
+        }
+    }
+
+    private fun mergeOrSplitPages(imageSource: BufferedSource, imageSource2: BufferedSource?): BufferedSource? {
+        if (imageSource2 == null) {
+            return process(item, imageSource)
+        }
+
+        if (viewer.config.doublePages) {
+            val primaryWide = isWideImage(imageSource)
+            if (primaryWide) {
+                viewer.onWidePageDetected(page)
+                return imageSource
+            }
+
+            val secondaryPage = extraPage
+            val secondaryWide = secondaryPage != null && isWideImage(imageSource2)
+            if (secondaryWide) {
+                viewer.onWidePageDetected(secondaryPage!!)
+                return imageSource2
+            }
+        }
+
+        val bitmap1 = ImageUtil.decodeBitmap(imageSource)
+        val bitmap2 = ImageUtil.decodeBitmap(imageSource2)
+
+        if (bitmap1 == null || bitmap2 == null) {
+            bitmap1?.recycle()
+            bitmap2?.recycle()
+            return imageSource
+        }
+
+        val isLTR = viewer !is R2LPagerViewer
+        val grayBackground = Color.rgb(0x20, 0x21, 0x25)
+        val background =
+            when (viewer.config.readerTheme) {
+                0 -> Color.WHITE
+                2 -> grayBackground
+                3 -> if (context.isNightMode()) grayBackground else Color.WHITE
+                else -> Color.BLACK
+            }
+
+        return try {
+            mergeBitmapsPerHalf(bitmap1, bitmap2, isLTR, background)
+        } finally {
+            bitmap1.recycle()
+            bitmap2.recycle()
+        }
+    }
+
+    private fun mergeBitmapsPerHalf(
+        firstBitmap: Bitmap,
+        secondBitmap: Bitmap,
+        isLTR: Boolean,
+        background: Int,
+    ): BufferedSource {
+        val firstContentRect = contentRect(firstBitmap)
+        val secondContentRect = contentRect(secondBitmap)
+        val metrics = context.resources.displayMetrics
+        val viewportWidth =
+            when {
+                width > 0 -> width
+                viewer.pager.width > 0 -> viewer.pager.width
+                else -> metrics.widthPixels
+            }.coerceAtLeast(2)
+        val viewportHeight =
+            when {
+                height > 0 -> height
+                viewer.pager.height > 0 -> viewer.pager.height
+                else -> metrics.heightPixels
+            }.coerceAtLeast(1)
+
+        val adjustedHingeGap = viewer.config.hingeGapSize.coerceAtLeast(0)
+        val cellWidth = ((viewportWidth - adjustedHingeGap).coerceAtLeast(2)) / 2
+        val result = createBitmap((cellWidth * 2) + adjustedHingeGap, viewportHeight)
+        val imageBounds = mutableListOf<BookPageBounds>()
+        val bitmapPaint =
+            Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).apply {
+                isFilterBitmap = true
+                isDither = true
+            }
+
+        try {
+            result.applyCanvas {
+                drawColor(background)
+
+                fun drawFitted(bitmap: Bitmap, content: Rect, cellLeft: Int, alignToCenter: Boolean) {
+                    // Crop while drawing instead of allocating another page-sized bitmap.
+                    val horizontalInset = if (content.width() > 8) 1 else 0
+                    val sourceRect = Rect(content).apply { inset(horizontalInset, 0) }
+                    val scale = min(
+                        cellWidth / sourceRect.width().toFloat(),
+                        viewportHeight / sourceRect.height().toFloat(),
+                    )
+                    val destWidth = (sourceRect.width() * scale).toInt().coerceAtLeast(1)
+                    val destHeight = (sourceRect.height() * scale).toInt().coerceAtLeast(1)
+                    val left =
+                        if (alignToCenter) {
+                            cellLeft + (cellWidth - destWidth)
+                        } else {
+                            cellLeft
+                        }
+                    val top = (viewportHeight - destHeight) / 2
+                    val dest = Rect(left, top, left + destWidth, top + destHeight)
+                    drawBitmap(bitmap, sourceRect, dest, bitmapPaint)
+                    imageBounds += BookPageBounds(
+                        dest.left.toFloat(),
+                        dest.top.toFloat(),
+                        dest.right.toFloat(),
+                        dest.bottom.toFloat(),
+                    )
+                }
+
+                val leftCellStart = 0
+                val rightCellStart = cellWidth + adjustedHingeGap
+                if (isLTR) {
+                    drawFitted(firstBitmap, firstContentRect, leftCellStart, alignToCenter = true)
+                    drawFitted(secondBitmap, secondContentRect, rightCellStart, alignToCenter = false)
+                } else {
+                    drawFitted(secondBitmap, secondContentRect, leftCellStart, alignToCenter = true)
+                    drawFitted(firstBitmap, firstContentRect, rightCellStart, alignToCenter = false)
+                }
+            }
+
+            val output = Buffer()
+            result.compress(Bitmap.CompressFormat.JPEG, 100, output.outputStream())
+            return BookPageImageSource(output, imageBounds.toList())
+        } finally {
+            result.recycle()
+        }
+    }
+
+    private fun contentRect(bitmap: Bitmap): Rect {
+        if (!viewer.config.imageCropBorders || bitmap.width <= 2 || bitmap.height <= 2) {
+            return Rect(0, 0, bitmap.width, bitmap.height)
+        }
+        return detectContentRect(bitmap)
+    }
+
+    private fun detectContentRect(bitmap: Bitmap): Rect {
+        val width = bitmap.width
+        val height = bitmap.height
+
+        fun colorsAreSimilar(first: Int, second: Int, tolerance: Int = 24): Boolean {
+            return kotlin.math.abs(Color.red(first) - Color.red(second)) <= tolerance &&
+                kotlin.math.abs(Color.green(first) - Color.green(second)) <= tolerance &&
+                kotlin.math.abs(Color.blue(first) - Color.blue(second)) <= tolerance
+        }
+
+        val corners = listOf(
+            bitmap.getPixel(0, 0),
+            bitmap.getPixel(width - 1, 0),
+            bitmap.getPixel(0, height - 1),
+            bitmap.getPixel(width - 1, height - 1),
+        )
+        val backgroundColor =
+            corners.maxByOrNull { candidate ->
+                corners.count { colorsAreSimilar(candidate, it) }
+            } ?: corners.first()
+
+        val sampleStepY = max(1, height / 160)
+        val sampleStepX = max(1, width / 160)
+        val maxColumnMismatches = max(2, ((height / sampleStepY) * 0.08f).toInt())
+        val maxRowMismatches = max(2, ((width / sampleStepX) * 0.08f).toInt())
+
+        fun isBackgroundColumn(x: Int): Boolean {
+            var mismatches = 0
+            for (y in 0 until height step sampleStepY) {
+                if (!colorsAreSimilar(bitmap.getPixel(x, y), backgroundColor)) {
+                    mismatches++
+                    if (mismatches > maxColumnMismatches) return false
+                }
+            }
+            return true
+        }
+
+        fun isBackgroundRow(y: Int): Boolean {
+            var mismatches = 0
+            for (x in 0 until width step sampleStepX) {
+                if (!colorsAreSimilar(bitmap.getPixel(x, y), backgroundColor)) {
+                    mismatches++
+                    if (mismatches > maxRowMismatches) return false
+                }
+            }
+            return true
+        }
+
+        var left = 0
+        while (left < width - 1 && isBackgroundColumn(left)) {
+            left++
+        }
+
+        var right = width - 1
+        while (right > left && isBackgroundColumn(right)) {
+            right--
+        }
+
+        var top = 0
+        while (top < height - 1 && isBackgroundRow(top)) {
+            top++
+        }
+
+        var bottom = height - 1
+        while (bottom > top && isBackgroundRow(bottom)) {
+            bottom--
+        }
+
+        return Rect(left, top, right + 1, bottom + 1)
+    }
+
+    private fun process(item: Any, imageSource: BufferedSource): BufferedSource {
+        val page = if (item is Pair<*, *>) item.first as ReaderPage else item as ReaderPage
+        if (viewer.config.dualPageRotateToFit) {
+            return rotateDualPage(imageSource)
+        }
+
+        if (shouldSplitWidePagesInSinglePageMode() && isWideImage(imageSource)) {
+            return splitInHalf(imageSource, page)
+        }
+
+        if (!viewer.config.doublePages) {
+            return imageSource
+        }
+
+        if (isWideImage(imageSource)) {
+            viewer.onWidePageDetected(page)
+        }
+        return imageSource
+    }
+
+    private fun rotateDualPage(imageSource: BufferedSource): BufferedSource {
+        val isDoublePage = isWideImage(imageSource)
+        return if (isDoublePage) {
+            val rotation = if (viewer.config.dualPageRotateToFitInvert) -90f else 90f
+            ImageUtil.rotateImage(imageSource, rotation)
+        } else {
+            imageSource
+        }
+    }
+
+    private fun splitInHalf(imageSource: BufferedSource, targetPage: ReaderPage = page): BufferedSource {
+        return ImageUtil.splitInHalf(imageSource, splitSideFor(targetPage))
+    }
+
+    private fun splitSideFor(targetPage: ReaderPage): ImageUtil.Side {
+        var side = when {
+            viewer is R2LPagerViewer && targetPage is InsertPage -> ImageUtil.Side.RIGHT
+            viewer is R2LPagerViewer && targetPage !is InsertPage -> ImageUtil.Side.LEFT
+            viewer is L2RPagerViewer && targetPage is InsertPage -> ImageUtil.Side.RIGHT
+            viewer is L2RPagerViewer && targetPage !is InsertPage -> ImageUtil.Side.LEFT
+            targetPage is InsertPage -> ImageUtil.Side.RIGHT
+            targetPage !is InsertPage -> ImageUtil.Side.LEFT
+            else -> error("We should choose a side!")
+        }
+
+        if (viewer.config.dualPageInvert) {
+            side = when (side) {
+                ImageUtil.Side.RIGHT -> ImageUtil.Side.LEFT
+                ImageUtil.Side.LEFT -> ImageUtil.Side.RIGHT
+            }
+        }
+
+        return side
+    }
+
+    private fun isWideImage(imageSource: BufferedSource): Boolean {
+        return ImageUtil.isWideImage(imageSource.peek())
+    }
+
+    private fun onPageSplit(page: ReaderPage) {
+        val newPage = InsertPage(page)
+        viewer.onPageSplit(page, newPage)
+    }
+
+    /**
+     * Called when the page has an error.
+     */
+    private fun setError(error: Throwable?) {
+        progressIndicator?.hide()
+        showErrorLayout(error)
+    }
+
+    override fun onImageLoaded() {
+        // The initial selection may arrive before ViewPager exposes this holder.
+        // Restore both enhancement targets before the first displayed frame releases the worker.
+        if (!hasReceivedSelection && viewer.isSelectedHolder(this)) {
+            android.util.Log.i("ImageEnhancer", "Restoring visible spread selection: ${page.index}/${extraPage?.index}")
+            onPageSelected(forward = true)
+        }
+        super.onImageLoaded()
+        progressIndicator?.hide()
+    }
+
+    override fun onPageSelected(forward: Boolean) {
+        hasReceivedSelection = true
+        setTransitionTargetPage(page)
+        super.onPageSelected(forward)
+        ImageEnhancer.reprioritizeAround(
+            pageIndex = page.index,
+            pageVariant = enhancementVariantFor(page),
+            secondaryPageIndex = extraPage?.index,
+            secondaryPageVariant = extraPage?.let(::enhancementVariantFor).orEmpty(),
+        )
+        ensureVisibleExtraPageEnhancement()
+    }
+
+    /**
+     * Called when an image fails to decode.
+     */
+    override fun onImageLoadError(error: Throwable?) {
+        if (recoverEnhancedCacheLoad(error)) return
+        super.onImageLoadError(error)
+        setError(error)
+    }
+
+    /**
+     * Called when an image is zoomed in/out.
+     */
+    override fun onScaleChanged(newScale: Float) {
+        super.onScaleChanged(newScale)
+        viewer.activity.hideMenu()
+    }
+
+    private fun showErrorLayout(error: Throwable?): ReaderErrorBinding {
+        if (errorLayout == null) {
+            errorLayout = ReaderErrorBinding.inflate(LayoutInflater.from(context), this, true)
+            errorLayout?.actionRetry?.viewer = viewer
+            errorLayout?.actionRetry?.setOnClickListener {
+                page.chapter.pageLoader?.retryPage(page)
+            }
+        }
+
+        val imageUrl = page.imageUrl
+        errorLayout?.actionOpenInWebView?.isVisible = imageUrl != null
+        if (imageUrl != null) {
+            if (imageUrl.startsWith("http", true)) {
+                errorLayout?.actionOpenInWebView?.viewer = viewer
+                errorLayout?.actionOpenInWebView?.setOnClickListener {
+                    val sourceId = viewer.activity.viewModel.manga?.source
+
+                    val intent = WebViewActivity.newIntent(context, imageUrl, sourceId)
+                    context.startActivity(intent)
+                }
+            }
+        }
+
+        errorLayout?.errorMessage?.text = with(context) { error?.formattedMessage }
+            ?: context.stringResource(MR.strings.decode_image_error)
+
+        errorLayout?.root?.isVisible = true
+        return errorLayout!!
+    }
+
+    /**
+     * Removes the decode error layout from the holder, if found.
+     */
+    private fun removeErrorLayout() {
+        errorLayout?.root?.isVisible = false
+        errorLayout = null
+    }
+
+    private fun ensureVisibleExtraPageEnhancement() {
+        val targetPage = extraPage ?: return
+        if (!readerPreferences.realCuganEnabled().get()) return
+
+        val mangaId = viewer.activity.viewModel.manga?.id ?: return
+        val chapterId = targetPage.chapter.chapter.id ?: return
+        targetPage.stream ?: return
+
+        ImageEnhancementCache.init(context)
+        val configHash = ImageEnhancementCache.getConfigHash(readerPreferences)
+
+        val pageVariant = enhancementVariantFor(targetPage)
+        if (ImageEnhancementCache.isCached(mangaId, chapterId, targetPage.index, configHash, pageVariant)) {
+            return
+        }
+
+        if (ImageEnhancementCache.isSkipped(mangaId, chapterId, targetPage.index, configHash, pageVariant)) {
+            ImageEnhancementCache.removeSkipMarker(mangaId, chapterId, targetPage.index, configHash, pageVariant)
+        }
+
+        logcat(LogPriority.DEBUG) {
+            "PagerPageHolder: Prioritizing visible extra page ${targetPage.index}/$pageVariant"
+        }
+        val enhancedStream = enhancementStreamFor(targetPage)
+        val originalStream = targetPage.stream
+        val imageUrl = targetPage.imageUrl
+        if (enhancedStream == null && originalStream == null && imageUrl == null) return
+
+        ImageEnhancer.enhanceLazy(
+            context = context.applicationContext,
+            mangaId = mangaId,
+            chapterId = chapterId,
+            pageIndex = targetPage.index,
+            highPriority = true,
+            pageVariant = pageVariant,
+        ) {
+            enhancedStream?.let(::readEnhancementSource)
+                ?: originalStream?.let(::readEnhancementSource)
+                ?: imageUrl
+        }
+    }
+
+    private fun readEnhancementSource(streamFn: () -> java.io.InputStream): BufferedSource? {
+        return try {
+            streamFn().use { Buffer().readFrom(it) }
+        } catch (e: Exception) {
+            logcat(LogPriority.WARN, e) { "PagerPageHolder: Failed to read enhancement source" }
+            null
+        }
+    }
+}
