@@ -9,6 +9,7 @@ import cafe.adriel.voyager.navigator.currentOrThrow
 import dev.zacsweers.metrox.viewmodel.assistedMetroViewModel
 import eu.kanade.presentation.browse.ExtensionDetailsScreen
 import eu.kanade.presentation.util.Screen
+import eu.kanade.tachiyomi.ui.webview.WebViewScreen
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.screens.EmptyScreen
 import tachiyomi.presentation.core.screens.LoadingScreen
@@ -44,6 +45,11 @@ data class ExtensionDetailsScreen(
                     onClickUninstall = viewModel::uninstallExtension,
                     onClickSource = viewModel::toggleSource,
                     onClickIncognito = viewModel::toggleIncognito,
+                    onOpenInWebView = state.extension.store
+                        ?.contact
+                        ?.website
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { website -> { navigator.push(WebViewScreen(website, state.extension.name)) } },
                 )
             }
         }

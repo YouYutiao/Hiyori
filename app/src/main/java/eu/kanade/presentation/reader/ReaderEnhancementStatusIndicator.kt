@@ -12,6 +12,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.PreviewLightDark
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.sp
 import eu.kanade.presentation.theme.TachiyomiPreviewTheme
 
@@ -23,11 +24,13 @@ import eu.kanade.presentation.theme.TachiyomiPreviewTheme
 fun ReaderEnhancementStatusIndicator(
     label: String,
     modifier: Modifier = Modifier,
+    fontSize: TextUnit = MaterialTheme.typography.bodySmall.fontSize,
+    fontWeight: FontWeight = FontWeight.Medium,
 ) {
     val style = TextStyle(
         color = Color(235, 235, 235),
-        fontSize = MaterialTheme.typography.bodySmall.fontSize,
-        fontWeight = FontWeight.Medium,
+        fontSize = fontSize,
+        fontWeight = fontWeight,
         letterSpacing = 0.5.sp,
     )
     val strokeStyle = style.copy(

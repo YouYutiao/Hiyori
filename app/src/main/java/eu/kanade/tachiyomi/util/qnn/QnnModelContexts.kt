@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.update
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
+import kotlin.concurrent.withLock
 
 /** Compiles bundled FP16 DLCs once per model/runtime/device, outside the image cache. */
 object QnnModelContexts {
@@ -43,11 +44,33 @@ object QnnModelContexts {
         return File(context.noBackupFilesDir, "qnn-contexts/$modelName/$key/context.bin")
     }
 
+    /**
+     * Bumped when the caller that wanted a model goes away (the user left the NPU backend).
+     * A compile that has not started yet is dropped instead of holding the HTP runtime for a
+     * backend the reader already switched away from.
+     */
+    @Volatile
+    private var requestGeneration = 0
+
+    fun cancelPendingPreparation() {
+        requestGeneration++
+    }
+
     /** Blocking: call on an IO worker. Serialization also prevents duplicate preparations from the UI and decoder. */
     @Synchronized
     fun prepare(context: Context, modelName: String, retry: Boolean = false): File? {
         val previous = mutableStates.value[modelName]
         if (previous is NpuModelStatus.Failed && !retry) return null
+        val request = requestGeneration
+        // Compiling loads the HTP runtime; the inference backend may be tearing the same runtime
+        // down at this exact moment on a backend switch. They must not overlap.
+        return NpuRuntimeLock.lock.withLock {
+            if (request != requestGeneration) return null
+            prepareLocked(context, modelName, request)
+        }
+    }
+
+    private fun prepareLocked(context: Context, modelName: String, request: Int): File? {
         return runCatching {
             val binary = contextFile(context, modelName)
             val directory = requireNotNull(binary.parentFile)
@@ -69,6 +92,7 @@ object QnnModelContexts {
                     temporary.outputStream().use(input::copyTo)
                 }
                 check(temporary.renameTo(dlc)) { "Unable to extract NPU model" }
+                if (request != requestGeneration) return null
                 val started = android.os.SystemClock.elapsedRealtime()
                 val error =
                     nativeCompile(dlc.absolutePath, binary.absolutePath, context.applicationInfo.nativeLibraryDir)

@@ -1,6 +1,5 @@
 package eu.kanade.presentation.reader.settings
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -8,22 +7,19 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
@@ -32,7 +28,6 @@ import androidx.core.graphics.alpha
 import androidx.core.graphics.blue
 import androidx.core.graphics.green
 import androidx.core.graphics.red
-import eu.kanade.presentation.more.settings.widget.TextPreferenceWidget
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences.Companion.ColorFilterMode
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderSettingsViewModel
@@ -45,6 +40,7 @@ import kotlinx.coroutines.withContext
 import tachiyomi.core.common.preference.getAndSet
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.CheckboxItem
+import tachiyomi.presentation.core.components.CollapsibleBox
 import tachiyomi.presentation.core.components.HeadingItem
 import tachiyomi.presentation.core.components.SettingsChipRow
 import tachiyomi.presentation.core.components.SettingsItemsPaddings
@@ -174,6 +170,12 @@ internal fun ColumnScope.ColorFilterPage(viewModel: ReaderSettingsViewModel) {
         val realCuganNoiseLevel by viewModel.preferences.realCuganNoiseLevel().collectAsState()
         val realCuganScale by viewModel.preferences.realCuganScale().collectAsState()
         val processingBackend by viewModel.preferences.realCuganProcessingBackend().collectAsState()
+        val processMaxWidth by viewModel.preferences.realCuganMaxSizeWidth().collectAsState()
+        val processMaxHeight by viewModel.preferences.realCuganMaxSizeHeight().collectAsState()
+        val tileSize by viewModel.preferences.realCuganTileSize().collectAsState()
+        val performanceMode by viewModel.preferences.realCuganPerformanceMode().collectAsState()
+        val preloadSize by viewModel.preferences.realCuganPreloadSize().collectAsState()
+        val precision by viewModel.preferences.realCuganPrecision().collectAsState()
         val npuDeviceAvailable = remember { Waifu2x.isQualcommNpuAvailable() }
         val mediaTekDeviceAvailable = remember { MediaTekNpu.isDeviceSupported() }
         val useQualcommNpu = processingBackend == Waifu2x.PROCESSING_BACKEND_QUALCOMM_NPU
@@ -189,6 +191,11 @@ internal fun ColumnScope.ColorFilterPage(viewModel: ReaderSettingsViewModel) {
         val mediaTekPreparationStates by MediaTekNpu.states.collectAsState()
         val preparationStates = if (useMediaTekNpu) mediaTekPreparationStates else qnnPreparationStates
         var preparationRetry by remember { mutableStateOf(0) }
+        // Leaving the NPU backend must not leave a queued model compile holding the HTP runtime;
+        // the backend switch needs it to tear the old context down.
+        DisposableEffect(useNpu) {
+            onDispose { if (useNpu) QnnModelContexts.cancelPendingPreparation() }
+        }
         LaunchedEffect(processingBackend, qnnModelName, preparationRetry) {
             val modelName = qnnModelName ?: return@LaunchedEffect
             withContext(Dispatchers.IO) {
@@ -225,361 +232,378 @@ internal fun ColumnScope.ColorFilterPage(viewModel: ReaderSettingsViewModel) {
             }
         }
 
-        Text(
-            text = stringResource(MR.strings.reader_enhancement_cache_note),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = SettingsItemsPaddings.Horizontal),
+        var advancedExpanded by remember { mutableStateOf(false) }
+        var performanceExpanded by remember { mutableStateOf(false) }
+
+        val preset = QualityPreset.detect(
+            QualityPreset.Values(
+                model = realCuganModel,
+                noise = realCuganNoiseLevel,
+                scale = realCuganScale,
+                // A preset pins both dimensions to the same value; anything else is custom.
+                maxSize = if (processMaxWidth == processMaxHeight) processMaxWidth else -1,
+                tileSize = tileSize,
+            ),
         )
-        SettingsChipRow(stringResource(MR.strings.reader_processing_backend)) {
-            FilterChip(
-                selected = processingBackend == Waifu2x.PROCESSING_BACKEND_VULKAN,
-                onClick = {
-                    viewModel.preferences.realCuganProcessingBackend().set(Waifu2x.PROCESSING_BACKEND_VULKAN)
-                },
-                label = { Text(stringResource(MR.strings.reader_backend_vulkan)) },
-            )
-            FilterChip(
-                selected = useQualcommNpu,
-                onClick = {
-                    viewModel.preferences.realCuganProcessingBackend().set(Waifu2x.PROCESSING_BACKEND_QUALCOMM_NPU)
-                },
-                enabled = npuDeviceAvailable,
-                label = { Text(stringResource(MR.strings.reader_backend_qualcomm_npu)) },
-            )
-            FilterChip(
-                selected = useMediaTekNpu,
-                onClick = {
-                    viewModel.preferences.realCuganProcessingBackend().set(Waifu2x.PROCESSING_BACKEND_MEDIATEK_NPU)
-                },
-                enabled = mediaTekDeviceAvailable,
-                label = { Text(stringResource(MR.strings.reader_backend_mediatek_npu)) },
-            )
-        }
 
-        SettingsChipRow(stringResource(MR.strings.reader_model)) {
-            val models = if (useNpu) {
-                listOf(
-                    0 to "Real-CUGAN SE",
-                    1 to "Real-CUGAN Pro",
-                    Waifu2x.MODEL_REAL_ESRGAN_ANIME to "Real-ESRGAN",
-                    Waifu2x.MODEL_W2XEX_PHOTO_SMALL to "W2xEX Photo Small",
-                    Waifu2x.MODEL_SPAN_NOMOSUNI_PHOTO to "SPAN NomosUni Photo",
-                )
-            } else {
-                listOf(
-                    0 to "Real-CUGAN SE",
-                    1 to "Real-CUGAN Pro",
-                    Waifu2x.MODEL_REAL_ESRGAN_ANIME to "Real-ESRGAN",
-                    3 to "Real-CUGAN Nose",
-                    4 to "Waifu2x",
-                    5 to "Waifu2x (Fast)",
-                    6 to "W2xEX Universal Fast",
-                    8 to "W2xEX Omni Mini V2",
-                    Waifu2x.MODEL_W2XEX_PHOTO_SMALL to "W2xEX Photo Small",
-                    16 to "AnimeJaNai v2 UltraCompact",
-                    18 to "sudo UltraCompact",
-                    Waifu2x.MODEL_SPAN_NOMOSUNI_PHOTO to "SPAN NomosUni Photo",
-                )
-            }
-            models.map { (modelId, name) ->
+        // Three ready-made levels first, expert fields second: the old page opened with a dozen
+        // model, denoise and pixel fields that a reader who just wants sharper images cannot judge.
+        SettingsChipRow(MR.strings.reader_section_quality_preset) {
+            QualityPreset.entries.forEach { option ->
                 FilterChip(
-                    selected = realCuganModel == modelId,
-                    onClick = { viewModel.preferences.realCuganModel().set(modelId) },
-                    label = { Text(name) },
-                )
-            }
-        }
-
-        if (qnnModelName != null) {
-            val status = preparationStates[qnnModelName]
-            Text(
-                text = stringResource(
-                    when (status) {
-                        is NpuModelStatus.Ready -> MR.strings.reader_npu_model_ready
-                        is NpuModelStatus.Failed -> MR.strings.reader_npu_model_failed
-                        else -> MR.strings.reader_npu_model_preparing
+                    selected = preset == option,
+                    onClick = {
+                        val values = option.values
+                        if (values == null) {
+                            // "Custom" has nothing to apply; it opens the fields it refers to.
+                            advancedExpanded = true
+                        } else {
+                            viewModel.preferences.realCuganModel().set(values.model)
+                            viewModel.preferences.realCuganNoiseLevel().set(values.noise)
+                            viewModel.preferences.realCuganScale().set(values.scale)
+                            viewModel.preferences.realCuganMaxSizeWidth().set(values.maxSize)
+                            viewModel.preferences.realCuganMaxSizeHeight().set(values.maxSize)
+                            viewModel.preferences.realCuganTileSize().set(values.tileSize)
+                        }
                     },
-                ),
-                modifier = Modifier.padding(horizontal = 24.dp),
-                style = MaterialTheme.typography.bodySmall,
-            )
-            if (status is NpuModelStatus.Failed) {
-                TextButton(onClick = { preparationRetry++ }, modifier = Modifier.padding(horizontal = 12.dp)) {
-                    Text(stringResource(MR.strings.action_retry))
-                }
-            }
-        }
-
-        if (realCuganModel == Waifu2x.MODEL_REAL_ESRGAN_ANIME) {
-            SettingsChipRow(stringResource(MR.strings.reader_model_style)) {
-                listOf(
-                    Waifu2x.REAL_ESRGAN_STYLE_ANIME to "Anime",
-                    Waifu2x.REAL_ESRGAN_STYLE_PHOTO to "Photo",
-                ).map { (style, name) ->
-                    FilterChip(
-                        selected = realEsrganStyle == style,
-                        onClick = { viewModel.preferences.realEsrganStyle().set(style) },
-                        label = { Text(name) },
-                    )
-                }
-            }
-        }
-
-        if (realCuganModel == 0 || realCuganModel == 1 || realCuganModel == 4 || realCuganModel == 5) {
-            val levels = if (realCuganModel == 1) { // Pro only has no-denoise, denoise3x, conservative
-                listOf(
-                    0 to stringResource(MR.strings.reader_none),
-                    3 to "3x",
-                    4 to stringResource(MR.strings.reader_conservative),
-                )
-            } else if (realCuganModel == 4) { // Waifu2x
-                listOf(0 to "1x", 1 to "2x", 2 to "3x")
-            } else if (realCuganModel == 5) { // Waifu2x Fast (UpConv7)
-                listOf(0 to stringResource(MR.strings.reader_none), 1 to "1x", 2 to "2x", 3 to "3x")
-            } else { // SE
-                listOf(
-                    0 to stringResource(MR.strings.reader_none),
-                    1 to "1x",
-                    2 to "2x",
-                    3 to "3x",
-                    4 to stringResource(MR.strings.reader_conservative),
+                    label = { Text(stringResource(option.titleRes)) },
                 )
             }
-
-            SettingsChipRow(stringResource(MR.strings.reader_denoise_level)) {
-                levels.map { (index, name) ->
-                    FilterChip(
-                        selected = realCuganNoiseLevel == index,
-                        onClick = { viewModel.preferences.realCuganNoiseLevel().set(index) },
-                        label = { Text(name) },
-                    )
-                }
-            }
         }
-
-        val fixedW2xExScale = Waifu2x.w2xExScaleFor(realCuganModel)
-        if (
-            (useNpu && realCuganModel != 1) ||
-            realCuganModel == 3 || realCuganModel == 4 || realCuganModel == 5 ||
-            (realCuganModel == Waifu2x.MODEL_REAL_ESRGAN_ANIME && realEsrganStyle == Waifu2x.REAL_ESRGAN_STYLE_PHOTO) ||
-            fixedW2xExScale == 2
+        // Backend-independent tuning sits right under the preset: it is what users reach for when
+        // images are too slow or too hot, and digging through model and resolution lists to find
+        // it was the main complaint about the old page.
+        CollapsibleBox(
+            heading = stringResource(MR.strings.reader_performance_precision_section),
+            expanded = performanceExpanded,
+            onExpandedChange = { performanceExpanded = it },
         ) {
-            SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
-                FilterChip(
-                    selected = true,
-                    onClick = {},
-                    label = {
-                        Text(
-                            if (fixedW2xExScale == 4) {
-                                "4x"
-                            } else {
-                                stringResource(MR.strings.reader_scale_fixed_2x)
+            Column {
+                if (!useNpu) {
+                    SettingsChipRow(stringResource(MR.strings.reader_gpu_performance_mode)) {
+                        listOf(
+                            0 to stringResource(MR.strings.reader_gpu_performance_high),
+                            1 to stringResource(MR.strings.reader_gpu_performance_balanced),
+                            2 to stringResource(MR.strings.reader_gpu_performance_power_saving),
+                        ).map { (value, name) ->
+                            FilterChip(
+                                selected = performanceMode == value,
+                                onClick = { viewModel.preferences.realCuganPerformanceMode().set(value) },
+                                label = { Text(name) },
+                            )
+                        }
+                    }
+
+                    SettingsChipRow(stringResource(MR.strings.reader_tile_size)) {
+                        listOf(64, 96, 128, 192, 256).map { value ->
+                            FilterChip(
+                                selected = tileSize == value,
+                                onClick = { viewModel.preferences.realCuganTileSize().set(value) },
+                                label = { Text(value.toString()) },
+                            )
+                        }
+                    }
+                }
+
+                val supportedPrecisions = if (useNpu) {
+                    listOf(0)
+                } else {
+                    listOf(0, 1, 3)
+                }
+                LaunchedEffect(useNpu, realCuganModel, precision) {
+                    if (precision !in supportedPrecisions) {
+                        viewModel.preferences.realCuganPrecision().set(supportedPrecisions.first())
+                    }
+                }
+                SettingsChipRow(stringResource(MR.strings.reader_precision)) {
+                    listOf(
+                        0 to stringResource(MR.strings.reader_precision_fp16),
+                        1 to stringResource(MR.strings.reader_precision_fp32),
+                        3 to stringResource(MR.strings.reader_precision_bf16),
+                    ).filter { (value, _) -> value in supportedPrecisions }.map { (value, name) ->
+                        FilterChip(
+                            selected = precision == value,
+                            onClick = { viewModel.preferences.realCuganPrecision().set(value) },
+                            label = { Text(name) },
+                        )
+                    }
+                }
+
+                if (!useNpu && precision == 0) {
+                    CheckboxItem(
+                        label = stringResource(MR.strings.reader_fp16_arithmetic),
+                        pref = viewModel.preferences.realCuganFp16Arithmetic(),
+                    )
+                }
+            }
+        }
+
+        CollapsibleBox(
+            heading = stringResource(MR.strings.reader_advanced_settings),
+            expanded = advancedExpanded,
+            onExpandedChange = { advancedExpanded = it },
+        ) {
+            Column {
+                SettingsChipRow(stringResource(MR.strings.reader_processing_backend)) {
+                    FilterChip(
+                        selected = processingBackend == Waifu2x.PROCESSING_BACKEND_VULKAN,
+                        onClick = {
+                            viewModel.preferences.realCuganProcessingBackend()
+                                .set(Waifu2x.PROCESSING_BACKEND_VULKAN)
+                        },
+                        label = { Text(stringResource(MR.strings.reader_backend_vulkan)) },
+                    )
+                    FilterChip(
+                        selected = useQualcommNpu,
+                        onClick = {
+                            viewModel.preferences.realCuganProcessingBackend()
+                                .set(Waifu2x.PROCESSING_BACKEND_QUALCOMM_NPU)
+                        },
+                        enabled = npuDeviceAvailable,
+                        label = { Text(stringResource(MR.strings.reader_backend_qualcomm_npu)) },
+                    )
+                    FilterChip(
+                        selected = useMediaTekNpu,
+                        onClick = {
+                            viewModel.preferences.realCuganProcessingBackend()
+                                .set(Waifu2x.PROCESSING_BACKEND_MEDIATEK_NPU)
+                        },
+                        enabled = mediaTekDeviceAvailable,
+                        label = { Text(stringResource(MR.strings.reader_backend_mediatek_npu)) },
+                    )
+                }
+
+                if (qnnModelName != null) {
+                    val status = preparationStates[qnnModelName]
+                    Text(
+                        text = stringResource(
+                            when (status) {
+                                is NpuModelStatus.Ready -> MR.strings.reader_npu_model_ready
+                                is NpuModelStatus.Failed -> MR.strings.reader_npu_model_failed
+                                else -> MR.strings.reader_npu_model_preparing
+                            },
+                        ),
+                        modifier = Modifier.padding(horizontal = 24.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (status is NpuModelStatus.Failed) {
+                        TextButton(onClick = { preparationRetry++ }, modifier = Modifier.padding(horizontal = 12.dp)) {
+                            Text(stringResource(MR.strings.action_retry))
+                        }
+                    }
+                }
+
+                SettingsChipRow(stringResource(MR.strings.reader_model)) {
+                    val models = if (useNpu) {
+                        listOf(
+                            0 to "Real-CUGAN SE",
+                            1 to "Real-CUGAN Pro",
+                            Waifu2x.MODEL_REAL_ESRGAN_ANIME to "Real-ESRGAN",
+                            Waifu2x.MODEL_W2XEX_PHOTO_SMALL to "W2xEX Photo Small",
+                            Waifu2x.MODEL_SPAN_NOMOSUNI_PHOTO to "SPAN NomosUni Photo",
+                        )
+                    } else {
+                        listOf(
+                            0 to "Real-CUGAN SE",
+                            1 to "Real-CUGAN Pro",
+                            Waifu2x.MODEL_REAL_ESRGAN_ANIME to "Real-ESRGAN",
+                            3 to "Real-CUGAN Nose",
+                            4 to "Waifu2x",
+                            5 to "Waifu2x (Fast)",
+                            6 to "W2xEX Universal Fast",
+                            8 to "W2xEX Omni Mini V2",
+                            Waifu2x.MODEL_W2XEX_PHOTO_SMALL to "W2xEX Photo Small",
+                            16 to "AnimeJaNai v2 UltraCompact",
+                            18 to "sudo UltraCompact",
+                            Waifu2x.MODEL_SPAN_NOMOSUNI_PHOTO to "SPAN NomosUni Photo",
+                        )
+                    }
+                    models.map { (modelId, name) ->
+                        FilterChip(
+                            selected = realCuganModel == modelId,
+                            onClick = { viewModel.preferences.realCuganModel().set(modelId) },
+                            label = { Text(name) },
+                        )
+                    }
+                }
+
+                if (realCuganModel == Waifu2x.MODEL_REAL_ESRGAN_ANIME) {
+                    SettingsChipRow(stringResource(MR.strings.reader_model_style)) {
+                        listOf(
+                            Waifu2x.REAL_ESRGAN_STYLE_ANIME to "Anime",
+                            Waifu2x.REAL_ESRGAN_STYLE_PHOTO to "Photo",
+                        ).map { (style, name) ->
+                            FilterChip(
+                                selected = realEsrganStyle == style,
+                                onClick = { viewModel.preferences.realEsrganStyle().set(style) },
+                                label = { Text(name) },
+                            )
+                        }
+                    }
+                }
+
+                if (realCuganModel == 0 || realCuganModel == 1 || realCuganModel == 4 || realCuganModel == 5) {
+                    val levels = if (realCuganModel == 1) { // Pro only has no-denoise, denoise3x, conservative
+                        listOf(
+                            0 to stringResource(MR.strings.reader_none),
+                            3 to "3x",
+                            4 to stringResource(MR.strings.reader_conservative),
+                        )
+                    } else if (realCuganModel == 4) { // Waifu2x
+                        listOf(0 to "1x", 1 to "2x", 2 to "3x")
+                    } else if (realCuganModel == 5) { // Waifu2x Fast (UpConv7)
+                        listOf(0 to stringResource(MR.strings.reader_none), 1 to "1x", 2 to "2x", 3 to "3x")
+                    } else { // SE
+                        listOf(
+                            0 to stringResource(MR.strings.reader_none),
+                            1 to "1x",
+                            2 to "2x",
+                            3 to "3x",
+                            4 to stringResource(MR.strings.reader_conservative),
+                        )
+                    }
+
+                    SettingsChipRow(stringResource(MR.strings.reader_denoise_level)) {
+                        levels.map { (index, name) ->
+                            FilterChip(
+                                selected = realCuganNoiseLevel == index,
+                                onClick = { viewModel.preferences.realCuganNoiseLevel().set(index) },
+                                label = { Text(name) },
+                            )
+                        }
+                    }
+                }
+
+                val fixedW2xExScale = Waifu2x.w2xExScaleFor(realCuganModel)
+                if (
+                    (useNpu && realCuganModel != 1) ||
+                    realCuganModel == 3 || realCuganModel == 4 || realCuganModel == 5 ||
+                    (
+                        realCuganModel == Waifu2x.MODEL_REAL_ESRGAN_ANIME &&
+                            realEsrganStyle == Waifu2x.REAL_ESRGAN_STYLE_PHOTO
+                        ) ||
+                    fixedW2xExScale == 2
+                ) {
+                    SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
+                        FilterChip(
+                            selected = true,
+                            onClick = {},
+                            label = {
+                                Text(
+                                    if (fixedW2xExScale == 4) {
+                                        "4x"
+                                    } else {
+                                        stringResource(MR.strings.reader_scale_fixed_2x)
+                                    },
+                                )
                             },
                         )
+                    }
+                } else if (fixedW2xExScale == 4) {
+                    SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
+                        FilterChip(
+                            selected = true,
+                            onClick = {},
+                            label = { Text("4x") },
+                        )
+                    }
+                } else if (realCuganModel == 1) { // Pro only supports 2x, 3x
+                    SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
+                        listOf(2, 3).map { scale ->
+                            FilterChip(
+                                selected = realCuganScale == scale,
+                                onClick = { viewModel.preferences.realCuganScale().set(scale) },
+                                label = { Text("${scale}x") },
+                            )
+                        }
+                    }
+                } else {
+                    SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
+                        listOf(2, 3, 4).map { scale ->
+                            FilterChip(
+                                selected = realCuganScale == scale,
+                                onClick = { viewModel.preferences.realCuganScale().set(scale) },
+                                label = { Text("${scale}x") },
+                            )
+                        }
+                    }
+                }
+
+                SettingsChipRow(stringResource(MR.strings.reader_preload_pages)) {
+                    listOf(1, 2, 3, 5, 8).map { value ->
+                        FilterChip(
+                            selected = preloadSize == value,
+                            onClick = { viewModel.preferences.realCuganPreloadSize().set(value) },
+                            label = { Text(stringResource(MR.strings.reader_preload_pages_value, value)) },
+                        )
+                    }
+                }
+
+                // One cap for the long edge replaces the old pair of input boxes: a reader who
+                // does not know the numbers picks a level, and the fields only appear for Custom.
+                val sizeOptions = listOf(1280, 1600, 2048, 2560)
+                var showCustomSize by remember { mutableStateOf(false) }
+                val customSize = processMaxWidth != processMaxHeight || processMaxWidth !in sizeOptions
+                SettingsChipRow(stringResource(MR.strings.reader_output_size_limit)) {
+                    sizeOptions.forEach { value ->
+                        FilterChip(
+                            selected = processMaxWidth == value && processMaxHeight == value,
+                            onClick = {
+                                viewModel.preferences.realCuganMaxSizeWidth().set(value)
+                                viewModel.preferences.realCuganMaxSizeHeight().set(value)
+                                showCustomSize = false
+                            },
+                            label = { Text(value.toString()) },
+                        )
+                    }
+                    FilterChip(
+                        selected = processMaxWidth == 0 && processMaxHeight == 0,
+                        onClick = {
+                            viewModel.preferences.realCuganMaxSizeWidth().set(0)
+                            viewModel.preferences.realCuganMaxSizeHeight().set(0)
+                            showCustomSize = false
+                        },
+                        label = { Text(stringResource(MR.strings.reader_output_size_unlimited)) },
+                    )
+                    FilterChip(
+                        selected = customSize || showCustomSize,
+                        onClick = { showCustomSize = true },
+                        label = { Text(stringResource(MR.strings.reader_output_size_custom)) },
+                    )
+                }
+                if (customSize || showCustomSize) {
+                    ResolutionLimitFields(
+                        heading = stringResource(MR.strings.reader_processing_resolution),
+                        width = processMaxWidth,
+                        height = processMaxHeight,
+                        onWidthChange = { viewModel.preferences.realCuganMaxSizeWidth().set(it) },
+                        onHeightChange = { viewModel.preferences.realCuganMaxSizeHeight().set(it) },
+                    )
+                }
+
+                val skipMaxWidth by viewModel.preferences.realCuganSkipMaxSizeWidth().collectAsState()
+                val skipMaxHeight by viewModel.preferences.realCuganSkipMaxSizeHeight().collectAsState()
+                val skipLargePages = skipMaxWidth > 0 || skipMaxHeight > 0
+                CheckboxItem(
+                    label = stringResource(MR.strings.reader_skip_large_pages),
+                    subtitle = stringResource(MR.strings.reader_skip_large_pages_summary),
+                    checked = skipLargePages,
+                    onClick = {
+                        val target = if (skipLargePages) 0 else DEFAULT_SKIP_MAX_SIZE
+                        viewModel.preferences.realCuganSkipMaxSizeWidth().set(target)
+                        viewModel.preferences.realCuganSkipMaxSizeHeight().set(target)
                     },
                 )
-            }
-        } else if (fixedW2xExScale == 4) {
-            SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
-                FilterChip(
-                    selected = true,
-                    onClick = {},
-                    label = { Text("4x") },
-                )
-            }
-        } else if (realCuganModel == 1) { // Pro only supports 2x, 3x
-            SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
-                listOf(2, 3).map { scale ->
-                    FilterChip(
-                        selected = realCuganScale == scale,
-                        onClick = { viewModel.preferences.realCuganScale().set(scale) },
-                        label = { Text("${scale}x") },
+                if (skipLargePages) {
+                    ResolutionLimitFields(
+                        heading = stringResource(MR.strings.reader_max_resolution),
+                        width = skipMaxWidth,
+                        height = skipMaxHeight,
+                        onWidthChange = { viewModel.preferences.realCuganSkipMaxSizeWidth().set(it) },
+                        onHeightChange = { viewModel.preferences.realCuganSkipMaxSizeHeight().set(it) },
                     )
                 }
             }
-        } else {
-            SettingsChipRow(stringResource(MR.strings.reader_scale_factor)) {
-                listOf(2, 3, 4).map { scale ->
-                    FilterChip(
-                        selected = realCuganScale == scale,
-                        onClick = { viewModel.preferences.realCuganScale().set(scale) },
-                        label = { Text("${scale}x") },
-                    )
-                }
-            }
-        }
-
-        SettingsChipRow(stringResource(MR.strings.reader_preload_pages)) {
-            listOf(1, 2, 3, 5, 8).map { size ->
-                val realCuganPreloadSize by viewModel.preferences.realCuganPreloadSize().collectAsState()
-                FilterChip(
-                    selected = realCuganPreloadSize == size,
-                    onClick = { viewModel.preferences.realCuganPreloadSize().set(size) },
-                    label = { Text(stringResource(MR.strings.reader_preload_pages_value, size)) },
-                )
-            }
-        }
-
-        if (!useNpu) {
-            SettingsChipRow(stringResource(MR.strings.reader_gpu_performance_mode)) {
-                val performanceMode by viewModel.preferences.realCuganPerformanceMode().collectAsState()
-                listOf(
-                    0 to stringResource(MR.strings.reader_gpu_performance_high),
-                    1 to stringResource(MR.strings.reader_gpu_performance_balanced),
-                    2 to stringResource(MR.strings.reader_gpu_performance_power_saving),
-                ).map { (value, name) ->
-                    FilterChip(
-                        selected = performanceMode == value,
-                        onClick = { viewModel.preferences.realCuganPerformanceMode().set(value) },
-                        label = { Text(name) },
-                    )
-                }
-            }
-
-            SettingsChipRow(stringResource(MR.strings.reader_tile_size)) {
-                val tileSize by viewModel.preferences.realCuganTileSize().collectAsState()
-                listOf(64, 96, 128, 192, 256).map { value ->
-                    FilterChip(
-                        selected = tileSize == value,
-                        onClick = { viewModel.preferences.realCuganTileSize().set(value) },
-                        label = { Text(value.toString()) },
-                    )
-                }
-            }
-        }
-
-        val precision by viewModel.preferences.realCuganPrecision().collectAsState()
-        val supportedPrecisions = if (useNpu) {
-            listOf(0)
-        } else {
-            listOf(0, 1, 3)
-        }
-        LaunchedEffect(useNpu, realCuganModel, precision) {
-            if (precision !in supportedPrecisions) {
-                viewModel.preferences.realCuganPrecision().set(supportedPrecisions.first())
-            }
-        }
-        SettingsChipRow(stringResource(MR.strings.reader_precision)) {
-            listOf(
-                0 to stringResource(MR.strings.reader_precision_fp16),
-                1 to stringResource(MR.strings.reader_precision_fp32),
-                3 to stringResource(MR.strings.reader_precision_bf16),
-            ).filter { (value, _) -> value in supportedPrecisions }.map { (value, name) ->
-                FilterChip(
-                    selected = precision == value,
-                    onClick = { viewModel.preferences.realCuganPrecision().set(value) },
-                    label = { Text(name) },
-                )
-            }
-        }
-
-        if (!useNpu && precision == 0) {
-            CheckboxItem(
-                label = stringResource(MR.strings.reader_fp16_arithmetic),
-                pref = viewModel.preferences.realCuganFp16Arithmetic(),
-            )
-        }
-
-        val processMaxWidth by viewModel.preferences.realCuganMaxSizeWidth().collectAsState()
-        val processMaxHeight by viewModel.preferences.realCuganMaxSizeHeight().collectAsState()
-        ResolutionLimitFields(
-            heading = stringResource(MR.strings.reader_processing_resolution),
-            width = processMaxWidth,
-            height = processMaxHeight,
-            onWidthChange = { viewModel.preferences.realCuganMaxSizeWidth().set(it) },
-            onHeightChange = { viewModel.preferences.realCuganMaxSizeHeight().set(it) },
-        )
-
-        val skipMaxWidth by viewModel.preferences.realCuganSkipMaxSizeWidth().collectAsState()
-        val skipMaxHeight by viewModel.preferences.realCuganSkipMaxSizeHeight().collectAsState()
-        ResolutionLimitFields(
-            heading = stringResource(MR.strings.reader_max_resolution),
-            width = skipMaxWidth,
-            height = skipMaxHeight,
-            onWidthChange = { viewModel.preferences.realCuganSkipMaxSizeWidth().set(it) },
-            onHeightChange = { viewModel.preferences.realCuganSkipMaxSizeHeight().set(it) },
-        )
-
-        TextPreferenceWidget(
-            title = stringResource(MR.strings.reader_section_enhancement_status_moved),
-            onPreferenceClick = {},
-        )
-
-        val prewarmEnabled by viewModel.preferences.prewarmEnabled().collectAsState()
-        val prewarmQueueCount by viewModel.prewarmQueueCount.collectAsState()
-        var showPrewarmRules by remember { mutableStateOf(false) }
-        TextPreferenceWidget(
-            title = stringResource(MR.strings.pref_prewarm_enabled),
-            subtitle = if (prewarmQueueCount > 0) {
-                stringResource(MR.strings.pref_prewarm_entry_summary_active, prewarmQueueCount)
-            } else {
-                stringResource(MR.strings.pref_prewarm_entry_summary)
-            },
-            widget = {
-                Switch(
-                    checked = prewarmEnabled,
-                    onCheckedChange = { viewModel.preferences.prewarmEnabled().set(it) },
-                )
-            },
-            onPreferenceClick = { showPrewarmRules = true },
-        )
-        if (showPrewarmRules) {
-            val batteryPolicy by viewModel.preferences.prewarmBatteryPolicy().collectAsState()
-            AlertDialog(
-                onDismissRequest = { showPrewarmRules = false },
-                title = { Text(stringResource(MR.strings.pref_prewarm_enabled)) },
-                text = {
-                    Column {
-                        Text(
-                            text = stringResource(MR.strings.pref_prewarm_enabled_summary),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Text(
-                            text = stringResource(MR.strings.prewarm_battery_policy_title),
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.padding(top = 12.dp),
-                        )
-                        listOf(
-                            ReaderPreferences.BATTERY_POLICY_CHARGE_ONLY to
-                                MR.strings.prewarm_battery_policy_charge_only,
-                            ReaderPreferences.BATTERY_POLICY_SUFFICIENT to
-                                MR.strings.prewarm_battery_policy_sufficient,
-                            ReaderPreferences.BATTERY_POLICY_ANY_TIME to
-                                MR.strings.prewarm_battery_policy_any_time,
-                        ).forEach { (value, label) ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { viewModel.preferences.prewarmBatteryPolicy().set(value) }
-                                    .padding(vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                RadioButton(
-                                    selected = batteryPolicy == value,
-                                    onClick = { viewModel.preferences.prewarmBatteryPolicy().set(value) },
-                                )
-                                Text(
-                                    text = stringResource(label),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    modifier = Modifier.padding(start = 4.dp),
-                                )
-                            }
-                        }
-                        Text(
-                            text = stringResource(MR.strings.prewarm_battery_policy_note),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showPrewarmRules = false }) {
-                        Text(stringResource(MR.strings.action_ok))
-                    }
-                },
-            )
         }
     }
 }
@@ -655,3 +679,6 @@ private const val ALPHA_MASK: Long = 0xFF000000
 private const val RED_MASK: Long = 0x00FF0000
 private const val GREEN_MASK: Long = 0x0000FF00
 private const val BLUE_MASK: Long = 0x000000FF
+
+/** Default cap used when "Skip huge pages" is switched on; large enough for any normal page. */
+private const val DEFAULT_SKIP_MAX_SIZE = 4096

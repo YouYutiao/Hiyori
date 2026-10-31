@@ -3,10 +3,14 @@ package eu.kanade.tachiyomi.ui.manga
 import android.content.Context
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -17,6 +21,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -227,6 +232,43 @@ class MangaScreen(
                 dismissButton = {
                     TextButton(onClick = { viewModel.dismissPrewarmEducation(false) }) {
                         Text(stringResource(MR.strings.prewarm_education_later))
+                    }
+                },
+            )
+        }
+
+        val downloadPrompt by viewModel.downloadPrompt.collectAsStateWithLifecycle()
+        if (downloadPrompt != null) {
+            var dontAskAgain by remember(downloadPrompt) { mutableStateOf(false) }
+            AlertDialog(
+                onDismissRequest = viewModel::dismissDownloadPrompt,
+                title = { Text(stringResource(MR.strings.prewarm_after_download_title)) },
+                text = {
+                    Column {
+                        Text(stringResource(MR.strings.prewarm_after_download_message))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { dontAskAgain = !dontAskAgain }
+                                .padding(top = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(
+                                checked = dontAskAgain,
+                                onCheckedChange = { dontAskAgain = it },
+                            )
+                            Text(stringResource(MR.strings.prewarm_after_download_dont_ask))
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { viewModel.resolveDownloadPrompt(prewarm = true, dontAskAgain) }) {
+                        Text(stringResource(MR.strings.prewarm_after_download_always))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { viewModel.resolveDownloadPrompt(prewarm = false, dontAskAgain) }) {
+                        Text(stringResource(MR.strings.prewarm_after_download_never))
                     }
                 },
             )

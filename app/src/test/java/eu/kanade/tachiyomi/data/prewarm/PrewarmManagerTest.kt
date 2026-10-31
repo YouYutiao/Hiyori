@@ -173,16 +173,32 @@ class PrewarmManagerTest {
         override fun bytes(segmentIndex: Int): Any? = null
     }
 
+    /** In-memory stand-in for the on-disk snapshot; restore and save never suspend here. */
+    private class FakeQueueStore : PrewarmQueueStore {
+        var stored: PrewarmQueueSnapshot? = null
+        var saved: PrewarmQueueSnapshot? = null
+
+        override suspend fun restore(): PrewarmQueueSnapshot? = stored
+
+        override suspend fun save(snapshot: PrewarmQueueSnapshot) {
+            saved = snapshot
+        }
+    }
+
     private class Fixture(
         val cache: FakeCacheBridge = FakeCacheBridge(),
         val constraints: FakeConstraints = FakeConstraints(),
         val config: FakeConfigSource = FakeConfigSource(),
+        val store: FakeQueueStore = FakeQueueStore(),
         pageCounts: Map<Long, Int> = emptyMap(),
         missingChapters: Set<Long> = emptySet(),
         segmentsPerPage: Int = 0,
     ) {
         val enhancer = FakeEnhancer(cache)
         val pageSource = FakePageSource(pageCounts, missingChapters, segmentsPerPage)
+
+        /** Only restore tests populate it; everything else starts from an empty queue. */
+        val resolver: PrewarmQueueResolver = PrewarmQueueResolver { _, _ -> null }
     }
 
     @Test
@@ -195,6 +211,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -224,6 +242,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -247,6 +267,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -276,6 +298,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -295,6 +319,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -319,6 +345,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -340,6 +368,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -361,6 +391,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -382,6 +414,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         // The reader opens while the second page is still enhancing, simulating the
@@ -422,6 +456,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -453,6 +489,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         // No live chapter remains after the gate breaks mid-run, so the watchdog is
@@ -491,6 +529,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -520,6 +560,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -552,6 +594,8 @@ class PrewarmManagerTest {
             fixture.cache,
             fixture.enhancer,
             fixture.config,
+            fixture.store,
+            fixture.resolver,
             backgroundScope,
         )
         manager.queueChapters(manga, listOf(chapter(10L)))
@@ -725,12 +769,166 @@ class PrewarmManagerTest {
         fixture.cache.wasMarkedWarmed(1L, 10L) shouldBe false
     }
 
+    // region Persistence
+
+    @Test
+    fun `restores the queue of the last session and runs it`() = runTest {
+        val fixture = Fixture(pageCounts = mapOf(10L to 2))
+        fixture.store.stored = PrewarmQueueSnapshot(
+            entries = listOf(PrewarmQueueEntry(mangaId = 1L, chapterId = 10L, queuedAt = 7L)),
+        )
+        val manager = PrewarmManager(
+            fixture.constraints,
+            fixture.pageSource,
+            fixture.cache,
+            fixture.enhancer,
+            fixture.config,
+            fixture.store,
+            resolverTo(),
+            backgroundScope,
+        )
+
+        advanceTimeBy(10_000)
+        runCurrent()
+
+        val restored = manager.queueState.value.single()
+        restored.chapterId shouldBe 10L
+        restored.sourceName shouldBe "Test source"
+        restored.status shouldBe PrewarmStatus.DONE
+        // Listed is not enough: the restored chapter has to be dispatched again.
+        fixture.enhancer.enqueued shouldBe listOf(0, 1)
+    }
+
+    @Test
+    fun `restored chapters keep their place in join order`() = runTest {
+        val fixture = Fixture(pageCounts = mapOf(10L to 1, 11L to 1))
+        fixture.constraints.charging = false
+        fixture.store.stored = PrewarmQueueSnapshot(
+            entries = listOf(PrewarmQueueEntry(mangaId = 1L, chapterId = 10L, queuedAt = 500L)),
+        )
+        val manager = PrewarmManager(
+            fixture.constraints,
+            fixture.pageSource,
+            fixture.cache,
+            fixture.enhancer,
+            fixture.config,
+            fixture.store,
+            resolverTo(),
+            backgroundScope,
+        )
+        runCurrent()
+
+        manager.queueChapters(manga, listOf(chapter(11L)))
+        runCurrent()
+        manager.sortQueue(PrewarmSort.QUEUED)
+
+        // A new chapter must not jump ahead of the one restored before it.
+        manager.queueState.value.map { it.chapterId } shouldBe listOf(10L, 11L)
+    }
+
+    @Test
+    fun `drops restored chapters that no longer exist`() = runTest {
+        val fixture = Fixture(pageCounts = mapOf(10L to 1))
+        fixture.store.stored = PrewarmQueueSnapshot(
+            entries = listOf(PrewarmQueueEntry(mangaId = 1L, chapterId = 99L)),
+        )
+        val manager = PrewarmManager(
+            fixture.constraints,
+            fixture.pageSource,
+            fixture.cache,
+            fixture.enhancer,
+            fixture.config,
+            fixture.store,
+            // The chapter row is gone, exactly like a series deleted while the app was closed.
+            PrewarmQueueResolver { _, _ -> null },
+            backgroundScope,
+        )
+
+        runCurrent()
+
+        manager.queueState.value shouldBe emptyList()
+        // The stale row leaves the file too, instead of being retried on every launch.
+        fixture.store.saved shouldBe PrewarmQueueSnapshot()
+    }
+
+    @Test
+    fun `persists the queue when it changes`() = runTest {
+        val fixture = Fixture(pageCounts = mapOf(10L to 1))
+        fixture.constraints.charging = false
+        val manager = manager(fixture)
+
+        manager.queueChapters(manga, listOf(chapter(10L)))
+        advanceTimeBy(5_000)
+        runCurrent()
+
+        val entry = fixture.store.saved?.entries?.single()
+        entry?.mangaId shouldBe 1L
+        entry?.chapterId shouldBe 10L
+    }
+
+    @Test
+    fun `does not persist finished chapters`() = runTest {
+        val fixture = Fixture(pageCounts = mapOf(10L to 1))
+        val manager = manager(fixture)
+
+        manager.queueChapters(manga, listOf(chapter(10L)))
+        advanceTimeBy(10_000)
+        runCurrent()
+
+        manager.queueState.value.single().status shouldBe PrewarmStatus.DONE
+        // Re-adding them next launch would only re-enumerate pages that are already cached.
+        fixture.store.saved?.entries shouldBe emptyList()
+    }
+
+    @Test
+    fun `restores a manual pause instead of resuming on its own`() = runTest {
+        val fixture = Fixture(pageCounts = mapOf(10L to 2))
+        fixture.store.stored = PrewarmQueueSnapshot(
+            entries = listOf(
+                PrewarmQueueEntry(
+                    mangaId = 1L,
+                    chapterId = 10L,
+                    status = PrewarmStatus.PAUSED.name,
+                    pauseReason = PrewarmPauseReason.MANUAL.name,
+                ),
+            ),
+            paused = true,
+        )
+        val manager = PrewarmManager(
+            fixture.constraints,
+            fixture.pageSource,
+            fixture.cache,
+            fixture.enhancer,
+            fixture.config,
+            fixture.store,
+            resolverTo(),
+            backgroundScope,
+        )
+
+        advanceTimeBy(10_000)
+        runCurrent()
+
+        val item = manager.queueState.value.single()
+        item.status shouldBe PrewarmStatus.PAUSED
+        item.pauseReason shouldBe PrewarmPauseReason.MANUAL
+        fixture.enhancer.enqueued shouldBe emptyList()
+    }
+
+    /** Resolves every stored entry to the manga and chapter the tests build their queue from. */
+    private fun resolverTo() = PrewarmQueueResolver { _, chapterId ->
+        PrewarmChapterRef(manga, chapter(chapterId), "Test source")
+    }
+
+    // endregion
+
     private fun TestScope.manager(fixture: Fixture) = PrewarmManager(
         fixture.constraints,
         fixture.pageSource,
         fixture.cache,
         fixture.enhancer,
         fixture.config,
+        fixture.store,
+        fixture.resolver,
         backgroundScope,
     )
 }

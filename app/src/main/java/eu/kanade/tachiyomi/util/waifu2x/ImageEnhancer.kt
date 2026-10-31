@@ -367,6 +367,18 @@ object ImageEnhancer {
         logcat(LogPriority.DEBUG) { "ImageEnhancer: Cancelled all enhancement work (reason=$reason)" }
     }
 
+    /**
+     * Cancels queued work and tears the native runtime down before returning.
+     *
+     * Used when what the native side is built for changes (backend, precision, FP16 arithmetic):
+     * the old reset was fire-and-forget, so a decode could rebuild the net first and have the fresh
+     * net deleted by the late reset - or, with QNN, run inference on a half-torn-down backend.
+     */
+    suspend fun restartNative(reason: String) {
+        cancelAll(reason, resetNative = false)
+        Waifu2x.restartForBackendChange()
+    }
+
     @Synchronized
     fun reprioritizeAround(
         pageIndex: Int,

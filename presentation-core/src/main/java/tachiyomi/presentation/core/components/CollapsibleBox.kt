@@ -28,12 +28,30 @@ fun CollapsibleBox(
     content: @Composable () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
+    CollapsibleBox(
+        heading = heading,
+        expanded = expanded,
+        onExpandedChange = { expanded = it },
+        content = content,
+    )
+}
 
+/**
+ * Same box with the state hoisted, so a caller can open it from somewhere else (e.g. a preset chip
+ * that needs to point at the expert fields).
+ */
+@Composable
+fun CollapsibleBox(
+    heading: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    content: @Composable () -> Unit,
+) {
     Column {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { expanded = !expanded }
+                .clickable { onExpandedChange(!expanded) }
                 .padding(horizontal = 24.dp, vertical = 12.dp),
         ) {
             Text(

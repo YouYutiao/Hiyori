@@ -67,6 +67,7 @@ fun MangaChapterListItem(
     downloadIndicatorEnabled: Boolean,
     cloudUploaded: Boolean,
     isPrewarmed: Boolean,
+    prewarmProgressProvider: () -> Int?,
     downloadStateProvider: () -> Download.State,
     downloadProgressProvider: () -> Int,
     chapterSwipeStartAction: LibraryPreferences.ChapterSwipeAction,
@@ -212,6 +213,8 @@ fun MangaChapterListItem(
                         enabled = downloadIndicatorEnabled,
                         downloadStateProvider = downloadStateProvider,
                         downloadProgressProvider = downloadProgressProvider,
+                        prewarmProgressProvider = prewarmProgressProvider,
+                        prewarmed = isPrewarmed,
                         onClick = { onDownloadClick?.invoke(it) },
                     )
                     if (isPrewarmed) {

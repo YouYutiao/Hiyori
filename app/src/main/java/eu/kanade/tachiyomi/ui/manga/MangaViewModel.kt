@@ -44,6 +44,7 @@ import eu.kanade.tachiyomi.data.download.DownloadCache
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.download.model.Download
 import eu.kanade.tachiyomi.data.prewarm.PrewarmManager
+import eu.kanade.tachiyomi.data.prewarm.PrewarmStatus
 import eu.kanade.tachiyomi.data.prewarm.isActive
 import eu.kanade.tachiyomi.data.track.EnhancedTracker
 import eu.kanade.tachiyomi.data.track.TrackerManager
@@ -60,10 +61,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
@@ -100,6 +103,7 @@ import tachiyomi.core.common.preference.mapAsCheckboxState
 import tachiyomi.core.common.util.lang.SubscriberGate
 import tachiyomi.core.common.util.lang.launchIO
 import tachiyomi.core.common.util.lang.pausedWhileUnsubscribed
+import tachiyomi.core.common.util.lang.withIOContext
 import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.category.interactor.GetCategories
 import tachiyomi.domain.category.interactor.SetMangaCategories
@@ -213,6 +217,12 @@ class MangaViewModel(
     private val openPrewarmQueueChannel = Channel<Unit>(Channel.BUFFERED)
     val openPrewarmQueue: Flow<Unit> = openPrewarmQueueChannel.receiveAsFlow()
 
+    /** Chapters waiting for the "prewarm after download?" answer. */
+    data class DownloadPrompt(val chapters: List<Chapter>, val startNow: Boolean)
+
+    private val _downloadPrompt = MutableStateFlow<DownloadPrompt?>(null)
+    val downloadPrompt: StateFlow<DownloadPrompt?> = _downloadPrompt.asStateFlow()
+
     private val successState: State.Success?
         get() = state.value as? State.Success
 
@@ -305,6 +315,21 @@ class MangaViewModel(
         }
     }
 
+    /**
+     * Percent of a chapter that the prewarm queue has already enhanced, for chapters it is working
+     * on right now. A chapter that is only queued has no percentage yet, and a finished one is
+     * covered by [prewarmedChapterIds] instead.
+     */
+    private val prewarmProgressByChapter = prewarmManager.queueState
+        .map { queue ->
+            queue.mapNotNull { item ->
+                val total = item.totalPages
+                val running = item.status == PrewarmStatus.RUNNING || item.status == PrewarmStatus.PAUSED
+                if (running && total > 0) item.chapterId to (item.pagesCompleted * 100 / total) else null
+            }.toMap()
+        }
+        .distinctUntilChanged()
+
     private val mangaAndChapters = combine(
         flow {
             // So an entry outside the library isn't shown with its old chapter settings first
@@ -315,11 +340,12 @@ class MangaViewModel(
         downloadCache.changes.pausedWhileUnsubscribed(),
         downloadManager.queueState.pausedWhileUnsubscribed(),
         prewarmedChapterIds,
-    ) { (manga, chapters), _, _, prewarmedIds ->
+        prewarmProgressByChapter,
+    ) { (manga, chapters), _, _, prewarmedIds, prewarmProgress ->
         MangaAndChapters(
             manga = manga,
             source = sourceManager.getOrStub(manga.source),
-            chapters = chapters.toChapterListItems(manga, prewarmedIds),
+            chapters = chapters.toChapterListItems(manga, prewarmedIds, prewarmProgress),
         )
     }
 
@@ -741,6 +767,7 @@ class MangaViewModel(
     private fun List<Chapter>.toChapterListItems(
         manga: Manga,
         prewarmedChapterIds: Set<Long> = emptySet(),
+        prewarmProgress: Map<Long, Int> = emptyMap(),
     ): List<ChapterList.Item> {
         val isLocal = manga.isLocal()
         val queuedDownloads = if (isLocal) emptyMap() else downloadManager.getQueuedDownloadsByChapterId()
@@ -761,6 +788,7 @@ class MangaViewModel(
                 // Enhanced pages only ever exist for chapters that are still on disk; a leftover
                 // cache directory for a deleted download must not badge anything.
                 isPrewarmed = downloaded && chapter.id in prewarmedChapterIds,
+                prewarmProgress = prewarmProgress[chapter.id].takeIf { downloaded },
             )
         }
     }
@@ -842,6 +870,82 @@ class MangaViewModel(
         startNow: Boolean,
     ) {
         if (successState == null) return
+        if (startNow && chapters.singleOrNull()?.id == null) return
+
+        // The download itself is unchanged; the only question is whether the finished chapters
+        // should also be queued for prewarming, which is asked once and then remembered.
+        when (readerPreferences.prewarmAfterDownload().get()) {
+            ReaderPreferences.PREWARM_AFTER_DOWNLOAD_ALWAYS -> enqueueDownload(chapters, startNow, prewarm = true)
+            ReaderPreferences.PREWARM_AFTER_DOWNLOAD_NEVER -> enqueueDownload(chapters, startNow, prewarm = false)
+            else -> _downloadPrompt.value = DownloadPrompt(chapters, startNow)
+        }
+    }
+
+    /** Answer to [downloadPrompt]; [dontAskAgain] stores the choice for future downloads. */
+    fun resolveDownloadPrompt(prewarm: Boolean, dontAskAgain: Boolean) {
+        val prompt = _downloadPrompt.value ?: return
+        if (dontAskAgain) {
+            readerPreferences.prewarmAfterDownload().set(
+                if (prewarm) {
+                    ReaderPreferences.PREWARM_AFTER_DOWNLOAD_ALWAYS
+                } else {
+                    ReaderPreferences.PREWARM_AFTER_DOWNLOAD_NEVER
+                },
+            )
+        }
+        _downloadPrompt.value = null
+        enqueueDownload(prompt.chapters, prompt.startNow, prewarm)
+    }
+
+    /** Dismissing the prompt downloads without prewarming and keeps asking next time. */
+    fun dismissDownloadPrompt() {
+        resolveDownloadPrompt(prewarm = false, dontAskAgain = false)
+    }
+
+    /**
+     * Queues the chapters for prewarming once their download finishes.
+     *
+     * Polling [DownloadManager.isChapterDownloaded] mirrors what the prewarm worker would see:
+     * it reads the same directory cache, so a chapter is only handed over once it is really on
+     * disk. The wait is bounded because a cancelled download must not keep a coroutine forever.
+     */
+    private fun queuePrewarmAfterDownload(manga: Manga, chapters: List<Chapter>) {
+        if (chapters.isEmpty()) return
+        appScope.launch {
+            val pending = chapters.associateBy { it.id }.toMutableMap()
+            val deadline = System.currentTimeMillis() + PREWARM_AFTER_DOWNLOAD_TIMEOUT_MS
+            while (pending.isNotEmpty() && System.currentTimeMillis() < deadline) {
+                val downloaded = pending.values.filter { chapter ->
+                    downloadManager.isChapterDownloaded(
+                        chapter.name,
+                        chapter.scanlator,
+                        chapter.url,
+                        manga.title,
+                        manga.source,
+                    )
+                }
+                if (downloaded.isNotEmpty()) {
+                    downloaded.forEach { pending.remove(it.id) }
+                    prewarmManager.queueChapters(manga, downloaded)
+                }
+                if (pending.isEmpty()) break
+                delay(2_000)
+            }
+            if (pending.isNotEmpty()) {
+                logcat(LogPriority.INFO) {
+                    "Prewarm: stopped waiting for ${pending.size} chapter(s) that never finished downloading"
+                }
+            }
+        }
+    }
+
+    private fun enqueueDownload(
+        chapters: List<Chapter>,
+        startNow: Boolean,
+        prewarm: Boolean,
+    ) {
+        if (successState == null) return
+        val manga = successState?.manga ?: return
         val startNowId = if (startNow) chapters.singleOrNull()?.id ?: return else null
 
         viewModelScope.launch {
@@ -852,6 +956,7 @@ class MangaViewModel(
                 } else {
                     downloadChapters(chapters)
                 }
+                if (prewarm) queuePrewarmAfterDownload(manga, chapters)
             }.join()
             if (startNowId == null) toggleAllSelection(false)
 
@@ -890,6 +995,19 @@ class MangaViewModel(
             }
             ChapterDownloadAction.DELETE -> {
                 deleteChapters(items.map { it.chapter })
+            }
+            ChapterDownloadAction.PREWARM -> {
+                val manga = successState?.manga ?: return
+                val chapters = items.map { it.chapter }
+                viewModelScope.launch {
+                    prewarmManager.queueChapters(manga, chapters)
+                }
+            }
+            ChapterDownloadAction.PREWARM_NOW -> {
+                items.firstOrNull()?.let { prewarmManager.prewarmNow(it.id) }
+            }
+            ChapterDownloadAction.PREWARM_CANCEL -> {
+                items.firstOrNull()?.let { prewarmManager.cancelChapter(it.id) }
             }
         }
     }
@@ -1276,6 +1394,11 @@ class MangaViewModel(
 
             if (chaptersToDownload.isNotEmpty()) {
                 downloadChapters(chaptersToDownload)
+                // An automatic download cannot ask, so it follows whatever the user answered
+                // the last time they were asked.
+                if (readerPreferences.prewarmAfterDownload().get() == ReaderPreferences.PREWARM_AFTER_DOWNLOAD_ALWAYS) {
+                    queuePrewarmAfterDownload(manga, chaptersToDownload)
+                }
             }
         }
     }
@@ -1610,6 +1733,8 @@ sealed class ChapterList {
         val selected: Boolean = false,
         /** Every page of the chapter already has an enhanced cache entry for the active config. */
         val isPrewarmed: Boolean = false,
+        /** Percent already enhanced by a running prewarm, or null when it is not being prewarmed. */
+        val prewarmProgress: Int? = null,
     ) : ChapterList() {
         val id = chapter.id
         val isDownloaded = downloadState == Download.State.DOWNLOADED
@@ -1618,3 +1743,6 @@ sealed class ChapterList {
 
 /** Quiet window for the prewarm cache scan, so a running queue doesn't trigger a walk per page. */
 private const val PREWARM_SCAN_DEBOUNCE_MS = 300L
+
+/** How long a queued download may stay unfinished before the after-download prewarm wait gives up. */
+private const val PREWARM_AFTER_DOWNLOAD_TIMEOUT_MS = 3 * 60 * 60 * 1000L

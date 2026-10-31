@@ -284,6 +284,12 @@ class UpdatesViewModel(
                 ChapterDownloadAction.DELETE -> {
                     deleteChapters(items)
                 }
+                // Prewarm entries only exist on the manga screen's downloaded-row menu; this list
+                // never renders them, so there is nothing to do if one arrives here.
+                ChapterDownloadAction.PREWARM,
+                ChapterDownloadAction.PREWARM_NOW,
+                ChapterDownloadAction.PREWARM_CANCEL,
+                -> Unit
             }
             toggleAllSelection(false)
         }

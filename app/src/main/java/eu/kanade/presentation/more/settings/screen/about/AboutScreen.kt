@@ -144,7 +144,6 @@ object AboutScreen : Screen() {
                         }
                         SwitchPreferenceWidget(
                             title = stringResource(MR.strings.pref_check_updates_on_start),
-                            subtitle = stringResource(MR.strings.pref_check_updates_on_start_summary),
                             checked = autoCheck,
                             onCheckedChanged = { enabled ->
                                 autoCheck = enabled

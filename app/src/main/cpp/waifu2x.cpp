@@ -1,3 +1,5 @@
+#include <android/api-level.h>
+
 #include "waifu2x.h"
 #include "periodic_texture_guard.h"
 #include "shaders.h"
@@ -165,6 +167,15 @@ Waifu2x::~Waifu2x() {
 }
 
 int Waifu2x::load(const std::string &parampath, const std::string &modelpath) {
+  // Android 16+ (API 36) Adreno drivers accept ncnn's fp16 convolution pipelines but fault inside
+  // vkCmdBindPipeline as soon as one is bound: the handle created for the fp16 variant is not valid
+  // on these drivers. Verified on a 2026 Qualcomm device (API 37): fp16 crashes on the first tile,
+  // fp32 finishes the page. Fall back rather than lose the whole backend on new hardware.
+  const int api_level = android_get_device_api_level();
+  if (precision_mode == 0 && vkdev && api_level >= 36) {
+    LOGD("FP16 Vulkan pipelines are unreliable on API %d; falling back to FP32", api_level);
+    precision_mode = 1;
+  }
   net.opt.use_vulkan_compute = vkdev ? true : false;
   net.opt.use_fp16_packed = false;
   net.opt.use_fp16_storage = false;

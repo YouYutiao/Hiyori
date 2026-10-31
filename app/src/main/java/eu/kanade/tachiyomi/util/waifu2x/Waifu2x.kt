@@ -5,13 +5,17 @@ package eu.kanade.tachiyomi.util.waifu2x
 import android.content.Context
 import android.graphics.Bitmap
 import eu.kanade.tachiyomi.util.mediatek.MediaTekNpu
+import eu.kanade.tachiyomi.util.qnn.NpuRuntimeLock
 import eu.kanade.tachiyomi.util.qnn.QnnModelContexts
 import eu.kanade.tachiyomi.util.qnn.QualcommHtp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.zip.ZipInputStream
+import kotlin.concurrent.withLock
 
 /**
  * Waifu2x image upscaler using ncnn.
@@ -65,7 +69,9 @@ object Waifu2x {
                 return false
             }
 
-            isInitialized = nativeInit(modelDir, noiseLevel, scale, 0, false)
+            isInitialized = NpuRuntimeLock.lock.withLock {
+                nativeInit(modelDir, noiseLevel, scale, 0, false)
+            }
             if (isInitialized) {
                 // Invalidate all other models
                 isRealCuganInitialized = false
@@ -184,15 +190,17 @@ object Waifu2x {
                 return false
             }
 
-            isRealCuganInitialized = nativeInitRealCugan(
-                modelDir,
-                effectiveNoiseLevel,
-                scale,
-                tileSleepMs,
-                currentConfig.precision,
-                currentConfig.fp16Arithmetic,
-                isPro,
-            )
+            isRealCuganInitialized = NpuRuntimeLock.lock.withLock {
+                nativeInitRealCugan(
+                    modelDir,
+                    effectiveNoiseLevel,
+                    scale,
+                    tileSleepMs,
+                    currentConfig.precision,
+                    currentConfig.fp16Arithmetic,
+                    isPro,
+                )
+            }
             if (isRealCuganInitialized) {
                 lastRealCuganConfig = currentConfig
                 nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -283,13 +291,15 @@ object Waifu2x {
         }
 
         val modelScale = if (isPhotoStyle) 4 else outputScale
-        isRealEsrganInitialized = nativeInitRealESRGAN(
-            modelDir,
-            modelScale,
-            outputScale,
-            config.precision,
-            config.fp16Arithmetic,
-        )
+        isRealEsrganInitialized = NpuRuntimeLock.lock.withLock {
+            nativeInitRealESRGAN(
+                modelDir,
+                modelScale,
+                outputScale,
+                config.precision,
+                config.fp16Arithmetic,
+            )
+        }
         if (isRealEsrganInitialized) {
             lastRealEsrganConfig = config
             nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -339,7 +349,9 @@ object Waifu2x {
             return false
         }
 
-        isNoseInitialized = nativeInitNose(modelDir, config.precision, config.fp16Arithmetic)
+        isNoseInitialized = NpuRuntimeLock.lock.withLock {
+            nativeInitNose(modelDir, config.precision, config.fp16Arithmetic)
+        }
         if (isNoseInitialized) {
             lastNoseConfig = config
             nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -386,7 +398,9 @@ object Waifu2x {
         val modelDir = extractModelsToCache(context, "waifu2x-models")
         if (modelDir == null) return false
 
-        isWaifu2xInitialized = nativeInit(modelDir, noise, scale, newConfig.precision, newConfig.fp16Arithmetic)
+        isWaifu2xInitialized = NpuRuntimeLock.lock.withLock {
+            nativeInit(modelDir, noise, scale, newConfig.precision, newConfig.fp16Arithmetic)
+        }
         if (isWaifu2xInitialized) {
             lastWaifu2xConfig = newConfig
             nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -429,8 +443,9 @@ object Waifu2x {
         val modelDir = extractModelsToCache(context, "waifu2x-models-upconv7")
         if (modelDir == null) return false
 
-        isWaifu2xInitialized =
+        isWaifu2xInitialized = NpuRuntimeLock.lock.withLock {
             nativeInitWaifu2xUpconv7(modelDir, noise, scale, newConfig.precision, newConfig.fp16Arithmetic)
+        }
         if (isWaifu2xInitialized) {
             lastWaifu2xConfig = newConfig
             nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -525,14 +540,16 @@ object Waifu2x {
             )
         }
 
-        isW2xExInitialized = nativeInitW2xEx(
-            modelDir,
-            modelStem,
-            effectiveScale,
-            config.precision,
-            config.fp16Arithmetic,
-            selectedModel.padding,
-        )
+        isW2xExInitialized = NpuRuntimeLock.lock.withLock {
+            nativeInitW2xEx(
+                modelDir,
+                modelStem,
+                effectiveScale,
+                config.precision,
+                config.fp16Arithmetic,
+                selectedModel.padding,
+            )
+        }
         if (isW2xExInitialized) {
             lastW2xExConfig = config
             nativeUpdatePerformanceConfig(tileSleepMs, tileSize)
@@ -645,7 +662,19 @@ object Waifu2x {
         lastNoseConfig = null
         lastWaifu2xConfig = null
         lastW2xExConfig = null
-        nativeDestroy()
+        // Freeing the HTP context must not overlap an NPU model compile in the same process.
+        NpuRuntimeLock.lock.withLock { nativeDestroy() }
+    }
+
+    /**
+     * Tears the native runtime down and returns only when it is gone.
+     *
+     * A backend or precision change used to schedule [resetRealCugan] on another coroutine and
+     * return, so a decode could rebuild the native net first and have that fresh net deleted by the
+     * late reset. Callers that change what the native side is built for await this instead.
+     */
+    suspend fun restartForBackendChange() {
+        withContext(Dispatchers.Default) { resetRealCugan() }
     }
 
     /**

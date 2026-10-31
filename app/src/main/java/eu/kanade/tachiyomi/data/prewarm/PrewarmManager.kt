@@ -16,6 +16,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -43,8 +46,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * Constraints: the queue only advances while charging (configurable) and the reader
  * is closed; otherwise the current chapter is paused and resumes automatically. A
  * cache-wide clear (configuration change) bumps the session generation and
- * re-evaluates every entry against the new config hash. The queue is in-memory by
- * design: pages already written to disk survive a process death as plain cache.
+ * re-evaluates every entry against the new config hash. The queue survives a process
+ * death through [PrewarmQueueStore]: what is restored is the list of chapters and
+ * their progress, while the cached pages themselves were always on disk.
  */
 @Inject
 @SingleIn(AppScope::class)
@@ -54,6 +58,8 @@ class PrewarmManager(
     private val cacheBridge: PrewarmCacheBridge,
     private val enhancer: PrewarmEnhancer,
     private val configSource: PrewarmConfigSource,
+    private val queueStore: PrewarmQueueStore,
+    private val queueResolver: PrewarmQueueResolver,
     @AppCoroutineScope private val scope: CoroutineScope,
 ) {
 
@@ -174,6 +180,46 @@ class PrewarmManager(
         return toQueue.size
     }
 
+    /**
+     * Puts a failed or skipped chapter back into the queue.
+     *
+     * Without this the only way back was to re-download the chapter and queue it from the manga
+     * screen, which the queue screen itself should be able to do.
+     */
+    fun retry(chapterId: Long) {
+        val item = _queueState.value.firstOrNull { it.chapterId == chapterId } ?: return
+        if (item.status != PrewarmStatus.ERROR && item.status != PrewarmStatus.SKIPPED) return
+        updateItem(chapterId) {
+            it.copy(
+                status = PrewarmStatus.QUEUED,
+                pauseReason = PrewarmPauseReason.NONE,
+                skipReason = null,
+                pagesFailed = 0,
+            )
+        }
+        signalWork()
+    }
+
+    /**
+     * Makes a queued chapter run as soon as the worker is free: it is un-paused, lifted to the top
+     * of its series block and the queue is resumed.
+     */
+    fun prewarmNow(chapterId: Long) {
+        val item = _queueState.value.firstOrNull { it.chapterId == chapterId } ?: return
+        if (item.status != PrewarmStatus.QUEUED && item.status != PrewarmStatus.PAUSED) return
+        updateItem(chapterId) {
+            it.copy(status = PrewarmStatus.QUEUED, pauseReason = PrewarmPauseReason.NONE)
+        }
+        moveChapterToTop(chapterId)
+        resume()
+        signalWork()
+    }
+
+    /** Drops one chapter from the queue regardless of which manga it came from. */
+    fun cancelChapter(chapterId: Long) {
+        cancelChapters(null, listOf(chapterId))
+    }
+
     fun cancel(item: PrewarmItem) {
         cancelChapters(item.mangaId, listOf(item.chapterId))
     }
@@ -206,6 +252,17 @@ class PrewarmManager(
     fun moveSource(sourceId: Long, toIndex: Int) {
         _queueState.update { PrewarmQueueOrder.moveSource(it, sourceId, toIndex) }
         _sortMode.value = PrewarmSort.CUSTOM
+    }
+
+    /** Row action: put a chapter first inside its series block. */
+    fun moveChapterToTop(chapterId: Long) {
+        moveChapter(chapterId, 0)
+    }
+
+    /** Row action: put a chapter last inside its series block. */
+    fun moveChapterToBottom(chapterId: Long) {
+        val mangaId = queueState.value.firstOrNull { it.chapterId == chapterId }?.mangaId ?: return
+        moveChapter(chapterId, queueState.value.count { it.mangaId == mangaId } - 1)
     }
 
     /** Drag a series header to reorder the blocks. */
@@ -251,6 +308,127 @@ class PrewarmManager(
         constraints.setReaderActive(active)
         logcat(LogPriority.DEBUG) { "Prewarm: reader ${if (active) "opened, pausing" else "closed, resuming"}" }
         if (!active) resumeConstraintPaused()
+    }
+
+    // endregion
+
+    init {
+        // The queue always processes with the reader's current enhancement settings. When those
+        // settings change, finished entries are only "done" for the old hash, so they are queued
+        // again - the same path a cache clear takes.
+        scope.launch {
+            configSource.configChanges().collect {
+                if (_queueState.value.isNotEmpty()) onCacheCleared()
+            }
+        }
+    }
+
+    init {
+        // Restore before persisting anything: the first snapshot written must never be the empty
+        // one that would wipe the file the previous process left behind.
+        scope.launch {
+            restoreQueue()
+            persistQueue()
+        }
+    }
+
+    // region Persistence
+
+    /**
+     * Brings back the queue left behind by the previous process.
+     *
+     * Entries whose manga or chapter no longer exists are dropped instead of being carried around.
+     * A run cannot survive a process death, so a stored RUNNING item comes back as QUEUED;
+     * constraint pauses re-evaluate themselves, while a manual pause is restored as what it was.
+     */
+    private suspend fun restoreQueue() {
+        val snapshot = queueStore.restore() ?: return
+        val restored = snapshot.entries.mapNotNull { entry ->
+            val ref = queueResolver.resolve(entry.mangaId, entry.chapterId)
+            if (ref == null) {
+                logcat(LogPriority.DEBUG) {
+                    "Prewarm: dropping restored chapter ${entry.chapterId} (no longer in the database)"
+                }
+                return@mapNotNull null
+            }
+            chapterRefs[ref.chapter.id] = ref.manga to ref.chapter
+            entry.toItem(ref)
+        }
+        if (restored.isEmpty()) {
+            if (snapshot.entries.isNotEmpty()) queueStore.save(PrewarmQueueSnapshot())
+            return
+        }
+
+        _queueState.update { current ->
+            val known = current.mapTo(HashSet()) { it.chapterId }
+            current + restored.filterNot { it.chapterId in known }
+        }
+        _sortMode.value = PrewarmSort.fromStored(snapshot.sort)
+        _manualPaused.value = snapshot.paused
+        // New chapters must sort after the restored ones in "join order".
+        queueSequence.updateAndGet { seq -> maxOf(seq, restored.maxOf { it.queuedAt }) }
+        logcat(LogPriority.INFO) { "Prewarm: restored ${restored.size} chapter(s) from the last session" }
+        signalWork()
+    }
+
+    /**
+     * Writes the queue to disk whenever it changes.
+     *
+     * Debounced on purpose: page progress moves every few hundred milliseconds, and only the last
+     * state of a burst is worth persisting. Finished chapters are dropped here rather than at
+     * restore time, so a restored queue re-runs only what is still pending.
+     */
+    private suspend fun persistQueue() {
+        combine(_queueState, _sortMode, _manualPaused) { queue, sort, paused ->
+            PrewarmQueueSnapshot(
+                entries = queue
+                    .filter { it.status != PrewarmStatus.DONE }
+                    .map { it.toQueueEntry() },
+                sort = sort.name,
+                paused = paused,
+            )
+        }
+            .distinctUntilChanged()
+            .debounce(PERSIST_DEBOUNCE_MS)
+            .collect { snapshot -> queueStore.save(snapshot) }
+    }
+
+    private fun PrewarmQueueEntry.toItem(ref: PrewarmChapterRef): PrewarmItem {
+        val storedStatus = PrewarmStatus.entries.firstOrNull { it.name == status } ?: PrewarmStatus.QUEUED
+        val storedPause = PrewarmPauseReason.entries.firstOrNull { it.name == pauseReason }
+            ?: PrewarmPauseReason.NONE
+        val restoredStatus = when (storedStatus) {
+            // Nothing was actually running any more once the process died.
+            PrewarmStatus.RUNNING -> PrewarmStatus.QUEUED
+            // Only the manual pause is user intent; a constraint pause is re-derived on its own.
+            PrewarmStatus.PAUSED -> if (storedPause == PrewarmPauseReason.MANUAL) {
+                PrewarmStatus.PAUSED
+            } else {
+                PrewarmStatus.QUEUED
+            }
+            else -> storedStatus
+        }
+        return PrewarmItem(
+            mangaId = mangaId,
+            mangaTitle = ref.manga.title,
+            sourceId = ref.manga.source,
+            sourceName = ref.sourceName,
+            chapterId = chapterId,
+            chapterName = ref.chapter.name,
+            chapterNumber = ref.chapter.chapterNumber,
+            queuedAt = queuedAt,
+            status = restoredStatus,
+            totalPages = totalPages,
+            pagesCompleted = pagesCompleted,
+            pagesCachedHits = pagesCachedHits,
+            pagesFailed = pagesFailed,
+            pauseReason = if (restoredStatus == PrewarmStatus.PAUSED) {
+                PrewarmPauseReason.MANUAL
+            } else {
+                PrewarmPauseReason.NONE
+            },
+            skipReason = PrewarmSkipReason.entries.firstOrNull { it.name == skipReason },
+        )
     }
 
     // endregion
@@ -772,6 +950,10 @@ class PrewarmManager(
         // How long to wait after the request disappeared from the enhancer before
         // declaring the page failed.
         const val REQUEST_GONE_GRACE_MS = 3_000L
+
+        // Quiet period before the queue snapshot is written: progress moves every page, and only
+        // the state a burst settles on is worth persisting.
+        const val PERSIST_DEBOUNCE_MS = 1_000L
 
         // 90% of ImageEnhancementCache's 3GB cap; leave headroom for reading-time work.
         val CACHE_BUDGET_SOFT_LIMIT: Long = 3L * 1024 * 1024 * 1024 * 9 / 10

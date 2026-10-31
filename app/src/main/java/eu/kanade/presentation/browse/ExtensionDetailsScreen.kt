@@ -74,6 +74,7 @@ fun ExtensionDetailsScreen(
     onClickUninstall: () -> Unit,
     onClickSource: (sourceId: Long) -> Unit,
     onClickIncognito: (Boolean) -> Unit,
+    onOpenInWebView: (() -> Unit)? = null,
 ) {
     val uriHandler = LocalUriHandler.current
 
@@ -84,7 +85,7 @@ fun ExtensionDetailsScreen(
                 navigateUp = navigateUp,
                 actions = {
                     AppBarActions(
-                        actions = listOf(
+                        actions = listOfNotNull(
                             AppBar.OverflowAction(
                                 title = stringResource(MR.strings.action_enable_all),
                                 onClick = onClickEnableAll,
@@ -97,6 +98,14 @@ fun ExtensionDetailsScreen(
                                 title = stringResource(MR.strings.pref_clear_cookies),
                                 onClick = onClickClearCookies,
                             ),
+                            // Same entry the source screen offers: the store page in the in-app
+                            // browser, which is what people open to read an extension's changelog.
+                            onOpenInWebView?.let { open ->
+                                AppBar.OverflowAction(
+                                    title = stringResource(MR.strings.action_open_in_web_view),
+                                    onClick = open,
+                                )
+                            },
                         ),
                     )
                 },

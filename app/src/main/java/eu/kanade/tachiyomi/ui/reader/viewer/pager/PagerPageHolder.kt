@@ -739,7 +739,9 @@ class PagerPageHolder(
             while (isActive) {
                 publishHalfState(leftPage, leftState)
                 publishHalfState(rightPage, rightState)
-                delay(500)
+                // 200 ms: long enough to stay cheap, short enough that "queued" does not outlive
+                // the moment the page actually starts enhancing by half a second.
+                delay(200)
             }
         }
     }

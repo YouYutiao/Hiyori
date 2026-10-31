@@ -7,6 +7,8 @@ import dev.zacsweers.metro.Provides
 import dev.zacsweers.metro.SingleIn
 import eu.kanade.tachiyomi.data.download.DownloadProvider
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import tachiyomi.domain.chapter.interactor.GetChapter
+import tachiyomi.domain.manga.interactor.GetManga
 import tachiyomi.domain.source.service.SourceManager
 
 @BindingContainer
@@ -37,4 +39,16 @@ object PrewarmBindings {
     @SingleIn(AppScope::class)
     fun providePrewarmConfigSource(preferences: ReaderPreferences): PrewarmConfigSource =
         ReaderPrewarmConfigSource(preferences)
+
+    @Provides
+    @SingleIn(AppScope::class)
+    fun providePrewarmQueueStore(context: Context): PrewarmQueueStore = FilePrewarmQueueStore(context)
+
+    @Provides
+    @SingleIn(AppScope::class)
+    fun providePrewarmQueueResolver(
+        getManga: GetManga,
+        getChapter: GetChapter,
+        sourceManager: SourceManager,
+    ): PrewarmQueueResolver = DatabasePrewarmQueueResolver(getManga, getChapter, sourceManager)
 }

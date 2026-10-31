@@ -214,7 +214,7 @@ class PagerConfig(
 
         readerPreferences.realCuganPrecision().changes()
             .drop(1)
-            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganPrecision changed") }
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.restartNative("realCuganPrecision changed") }
             .debounce(500)
             .onEach {
                 eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(viewer.activity)
@@ -224,7 +224,9 @@ class PagerConfig(
 
         readerPreferences.realCuganProcessingBackend().changes()
             .drop(1)
-            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganProcessingBackend changed") }
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.restartNative("realCuganProcessingBackend changed")
+            }
             .debounce(500)
             .onEach {
                 eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(viewer.activity)
@@ -234,7 +236,7 @@ class PagerConfig(
 
         readerPreferences.realCuganFp16Arithmetic().changes()
             .drop(1)
-            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganFp16Arithmetic changed") }
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.restartNative("realCuganFp16Arithmetic changed") }
             .debounce(500)
             .onEach {
                 imagePropertyChangedListener?.invoke()

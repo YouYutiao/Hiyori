@@ -1,38 +1,56 @@
-# Build files
-.gradle
-.kotlin
-build
+# Build outputs
+.gradle/
+.kotlin/
+build/
 app/.cxx/
+.cxx/
 app/release/
+captures/
+*.apk
+*.aab
+*.dm
 
-# IDE files
-*.iml
+# IDE files (the project icon is kept on purpose)
 .idea/*
 !.idea/icon.svg
-/captures
+*.iml
 
-# Configuration files
-keystore.properties
+# Local tooling scratch space
+.tmp/
+.zcode/
+.workbuddy/
+
+# Local configuration and signing material
 local.properties
-
-# Signing keys
+keystore.properties
 *.jks
+*.keystore
 
-# Android specific ignores
-*.dm
-*.apk
+# Local only: release upload token / gh credentials, never commit
+.release-token
+.github-token
 
-# Python generated files
+# Project documentation beyond README (kept locally, not part of the repository)
+CHANGELOG.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+
+# Internal design notes, research and handover documents (kept locally only)
+docs/
+
+# Logs, dumps and crash reports
+*.log
+*.hprof
+*.stackdump
+
+# Python tooling
 __pycache__/
 *.py[cod]
 
-# macOS specific files
+# OS junk
 .DS_Store
+Thumbs.db
 
-# Local only: release upload token / gh credentials, never commit
-.release-token
-.github-token
-
-# Local only: release upload token / gh credentials, never commit
-.release-token
-.github-token
+# Patch leftovers
+*.orig
+*.rej

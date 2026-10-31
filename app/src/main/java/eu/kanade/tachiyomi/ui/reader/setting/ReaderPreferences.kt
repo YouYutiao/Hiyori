@@ -33,6 +33,8 @@ class ReaderPreferences(
         }
         migrateEnhancementStatusVisibility()
         migrateEnhancementIndicatorMode()
+        migrateEnhancementIndicatorAxes()
+        migratePerformanceUsageItems()
         migratePrewarmBatteryPolicy()
     }
 
@@ -196,13 +198,149 @@ class ReaderPreferences(
     )
 
     /**
-     * Which enhancement indicators are drawn: [INDICATOR_MODE_HIDDEN] (0), [INDICATOR_MODE_BADGE] (1),
-     * [INDICATOR_MODE_PAGE_NUMBER] (2) or [INDICATOR_MODE_BOTH] (3).
+     * Legacy single-choice mode, only read by [migrateEnhancementIndicatorAxes]. Retired in favour
+     * of the three independent choices below: [enhancementIndicatorVisible],
+     * [enhancementIndicatorPlacement] and [enhancementIndicatorStyle].
      */
     fun enhancementIndicatorMode(): Preference<Int> = preferenceStore.getInt(
         "pref_enhancement_indicator_mode",
         INDICATOR_MODE_PAGE_NUMBER,
     )
+
+    /** Whether the enhancement status is drawn at all; the same switch as "不显示 / 显示". */
+    fun enhancementIndicatorVisible(): Preference<Boolean> = preferenceStore.getBoolean(
+        "pref_enhancement_indicator_visible",
+        true,
+    )
+
+    /**
+     * Where the status is drawn: any combination of [INDICATOR_PLACEMENT_LEFT],
+     * [INDICATOR_PLACEMENT_RIGHT] and [INDICATOR_PLACEMENT_PAGE_NUMBER].
+     *
+     * The two corners are mutually exclusive because the performance overlay always needs the other
+     * one; the page number marker can be added to either corner. See [togglePlacement].
+     */
+    fun enhancementIndicatorPlacement(): Preference<Int> = preferenceStore.getInt(
+        "pref_enhancement_indicator_placement_flags",
+        INDICATOR_PLACEMENT_PAGE_NUMBER,
+    )
+
+    /** Retired single-value placement, only read by [migrateEnhancementIndicatorAxes]. */
+    private fun legacyEnhancementIndicatorPlacement(): Preference<Int> = preferenceStore.getInt(
+        "pref_enhancement_indicator_placement",
+        LEGACY_PLACEMENT_LEFT,
+    )
+
+    /** How the corner badges read, see [INDICATOR_STYLE_TEXT]: words or percentages. */
+    fun enhancementIndicatorStyle(): Preference<Int> = preferenceStore.getInt(
+        "pref_enhancement_indicator_style",
+        INDICATOR_STYLE_TEXT,
+    )
+
+    /**
+     * Whether the performance readings are drawn: [PERFORMANCE_USAGE_HIDDEN] (0) or
+     * [PERFORMANCE_USAGE_ALWAYS] (2).
+     *
+     * The retired "only while enhancing" value (1) is still stored on devices that picked it; it is
+     * read as "shown" so nobody's overlay silently disappears after the option was removed.
+     */
+    fun performanceUsageMode(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_mode",
+        PERFORMANCE_USAGE_HIDDEN,
+    )
+
+    /**
+     * Which corner the readings use, [PERFORMANCE_CORNER_LEFT] or [PERFORMANCE_CORNER_RIGHT].
+     *
+     * While the enhancement status occupies a corner this value is ignored and the readings take
+     * the other one, see [performanceCorner]; the stored choice comes back once that corner is free.
+     */
+    fun performanceUsagePlacement(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_placement",
+        PERFORMANCE_CORNER_RIGHT,
+    )
+
+    /**
+     * Which readings are drawn, as flags of [PERFORMANCE_ITEM_CPU], [PERFORMANCE_ITEM_POWER] and
+     * [PERFORMANCE_ITEM_BATTERY]. At most [PERFORMANCE_ITEM_LIMIT] at a time, see
+     * [togglePerformanceItem].
+     */
+    fun performanceUsageItems(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_items",
+        PERFORMANCE_ITEM_CPU or PERFORMANCE_ITEM_POWER,
+    )
+
+    /** Text size of the readings overlay, same scale as [enhancementBadgeSize]. */
+    fun performanceUsageSize(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_size",
+        BADGE_SIZE_MEDIUM,
+    )
+
+    /** Font weight of the readings overlay, same scale as [enhancementBadgeWeight]. */
+    fun performanceUsageWeight(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_weight",
+        BADGE_WEIGHT_MEDIUM,
+    )
+
+    /**
+     * Extra spacing of the readings from their own screen edge, in dp.
+     *
+     * Independent from [enhancementBadgeOffsetX] so the two overlays can be aligned separately;
+     * measured from the side the readings sit on, exactly like the badge.
+     */
+    fun performanceUsageOffsetX(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_offset_x",
+        BADGE_OFFSET_X_DEFAULT,
+    )
+
+    /** Extra bottom padding of the readings in dp, see [performanceUsageOffsetX]. */
+    fun performanceUsageOffsetY(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_offset_y",
+        BADGE_OFFSET_Y_DEFAULT,
+    )
+
+    /** Text size of the enhancement badge, see [BADGE_SIZE_SMALL]. */
+    fun enhancementBadgeSize(): Preference<Int> = preferenceStore.getInt(
+        "pref_enhancement_badge_size",
+        BADGE_SIZE_MEDIUM,
+    )
+
+    /** Font weight of the enhancement badge, see [BADGE_WEIGHT_NORMAL]. */
+    fun enhancementBadgeWeight(): Preference<Int> = preferenceStore.getInt(
+        "pref_enhancement_badge_weight",
+        BADGE_WEIGHT_MEDIUM,
+    )
+
+    /**
+     * Extra spacing of the corner badge from its own screen edge, in dp.
+     *
+     * The badge sits in the corner chosen by [enhancementIndicatorPlacement] and never leaves it:
+     * for the left corner this is the start padding, for the right corner the end padding, so
+     * increasing it always moves the badge towards the page number.
+     */
+    fun enhancementBadgeOffsetX(): Preference<Int> = preferenceStore.getInt(
+        "pref_enhancement_badge_offset_x",
+        BADGE_OFFSET_X_DEFAULT,
+    )
+
+    /** Extra bottom padding of the corner badge in dp, see [enhancementBadgeOffsetX]. */
+    fun enhancementBadgeOffsetY(): Preference<Int> = preferenceStore.getInt(
+        "pref_enhancement_badge_offset_y",
+        BADGE_OFFSET_Y_DEFAULT,
+    )
+
+    /** Retired "both / cpu / power" choice, only read by [migratePerformanceUsageItems]. */
+    private fun performanceUsageContent(): Preference<Int> = preferenceStore.getInt(
+        "pref_performance_usage_content",
+        PERFORMANCE_USAGE_CONTENT_BOTH,
+    )
+
+    /** One-shot widening of the retired three-way choice into the item flags. */
+    private fun migratePerformanceUsageItems() {
+        val items = performanceUsageItems()
+        if (items.isSet()) return
+        items.set(performanceItemsForLegacyContent(performanceUsageContent().get()))
+    }
 
     /** Whether the one-time "what prewarm does" explanation has been shown. */
     fun prewarmEducatedShown() = preferenceStore.getBoolean("pref_prewarm_educated_shown", false)
@@ -215,6 +353,10 @@ class ReaderPreferences(
         "pref_prewarm_battery_policy",
         BATTERY_POLICY_CHARGE_ONLY,
     )
+
+    /** Set once the charging-only default has been lifted on an existing install. */
+    fun prewarmAnyTimeMigrated(): Preference<Boolean> =
+        preferenceStore.getBoolean("pref_prewarm_any_time_migrated", false)
 
     /**
      * One-shot mapping of the retired "only while charging" switch: on keeps the charger
@@ -257,7 +399,38 @@ class ReaderPreferences(
         mode.set(indicatorModeForLegacySettings(badgeVisible = badge, marker = marker))
     }
 
+    /**
+     * One-shot split of the retired single-choice mode into the three independent choices the
+     * settings screen now exposes. Keyed on the placement, which only this migration writes.
+     *
+     * A build that already stored the single-value placement is translated directly; the visibility
+     * and style it wrote stay as they are. Older installs are derived from the six-mode value.
+     */
+    private fun migrateEnhancementIndicatorAxes() {
+        val placement = enhancementIndicatorPlacement()
+        if (placement.isSet()) return
+        val legacyPlacement = legacyEnhancementIndicatorPlacement()
+        if (legacyPlacement.isSet()) {
+            placement.set(placementFlagsForLegacyPlacement(legacyPlacement.get()))
+            return
+        }
+        val mode = enhancementIndicatorMode().get()
+        enhancementIndicatorVisible().set(indicatorVisibleForLegacyMode(mode))
+        enhancementIndicatorStyle().set(indicatorStyleForLegacyMode(mode))
+        placement.set(placementFlagsForLegacyMode(mode))
+    }
+
     fun prewarmEnabled() = preferenceStore.getBoolean("pref_prewarm_enabled", true)
+
+    /**
+     * What to do when chapters are added to the download queue:
+     * [PREWARM_AFTER_DOWNLOAD_ASK] (0), [PREWARM_AFTER_DOWNLOAD_ALWAYS] (1) or
+     * [PREWARM_AFTER_DOWNLOAD_NEVER] (2).
+     */
+    fun prewarmAfterDownload(): Preference<Int> = preferenceStore.getInt(
+        "pref_prewarm_after_download",
+        PREWARM_AFTER_DOWNLOAD_ASK,
+    )
 
     fun prewarmRequireCharging() = preferenceStore.getBoolean("pref_prewarm_require_charging", true)
 
@@ -476,11 +649,225 @@ class ReaderPreferences(
         const val STATUS_VISIBILITY_PROCESSING_ONLY = 1
         const val STATUS_VISIBILITY_ALWAYS = 2
 
-        /** Enhancement indicator modes, see [enhancementIndicatorMode]. */
+        /** Legacy enhancement indicator modes, only read by the migration to the three axes. */
         const val INDICATOR_MODE_HIDDEN = 0
         const val INDICATOR_MODE_BADGE = 1
         const val INDICATOR_MODE_PAGE_NUMBER = 2
         const val INDICATOR_MODE_BOTH = 3
+
+        /** The same corner badge, drawn as a percentage ("20%") instead of the state word. */
+        const val INDICATOR_MODE_BADGE_NUMERIC = 4
+        const val INDICATOR_MODE_BOTH_NUMERIC = 5
+
+        /** Placement flags, see [enhancementIndicatorPlacement]. */
+        const val INDICATOR_PLACEMENT_LEFT = 1 shl 0
+        const val INDICATOR_PLACEMENT_RIGHT = 1 shl 1
+        const val INDICATOR_PLACEMENT_PAGE_NUMBER = 1 shl 2
+
+        /** Retired single-value placements, only read by [migrateEnhancementIndicatorAxes]. */
+        const val LEGACY_PLACEMENT_LEFT = 0
+        const val LEGACY_PLACEMENT_RIGHT = 1
+        const val LEGACY_PLACEMENT_PAGE_NUMBER = 2
+        const val LEGACY_PLACEMENT_ALL = 3
+
+        /** How the corner badges read, see [enhancementIndicatorStyle]. */
+        const val INDICATOR_STYLE_TEXT = 0
+        const val INDICATOR_STYLE_NUMERIC = 1
+
+        /** Whether the placement draws the badge in the bottom-left corner. */
+        fun drawsLeftBadge(placement: Int): Boolean = placement and INDICATOR_PLACEMENT_LEFT != 0
+
+        /** Whether the placement draws the badge in the bottom-right corner. */
+        fun drawsRightBadge(placement: Int): Boolean = placement and INDICATOR_PLACEMENT_RIGHT != 0
+
+        /** Whether the placement draws a corner badge at all; the text/numeric choice applies to it. */
+        fun drawsBadge(placement: Int): Boolean =
+            placement and (INDICATOR_PLACEMENT_LEFT or INDICATOR_PLACEMENT_RIGHT) != 0
+
+        /** Whether the placement marks enhanced pages on the page number indicator. */
+        fun marksPageNumber(placement: Int): Boolean =
+            placement and INDICATOR_PLACEMENT_PAGE_NUMBER != 0
+
+        /**
+         * Applies one tap on a placement chip.
+         *
+         * The two corners stay mutually exclusive and at least one placement has to remain, so a tap
+         * that would clear the last one is ignored and returns the placement unchanged.
+         */
+        fun togglePlacement(placement: Int, chip: Int): Int {
+            val next = when (chip) {
+                INDICATOR_PLACEMENT_LEFT, INDICATOR_PLACEMENT_RIGHT -> {
+                    if (placement and chip != 0) {
+                        placement and chip.inv()
+                    } else {
+                        (placement and INDICATOR_PLACEMENT_LEFT.inv() and INDICATOR_PLACEMENT_RIGHT.inv()) or chip
+                    }
+                }
+                else -> placement xor chip
+            }
+            return if (next == 0) placement else next
+        }
+
+        /** Legacy six-mode value → placement flags, used once by [migrateEnhancementIndicatorAxes]. */
+        fun placementFlagsForLegacyMode(mode: Int): Int = when (mode) {
+            INDICATOR_MODE_BADGE, INDICATOR_MODE_BADGE_NUMERIC -> INDICATOR_PLACEMENT_LEFT
+            INDICATOR_MODE_BOTH, INDICATOR_MODE_BOTH_NUMERIC ->
+                INDICATOR_PLACEMENT_LEFT or INDICATOR_PLACEMENT_PAGE_NUMBER
+            else -> INDICATOR_PLACEMENT_PAGE_NUMBER
+        }
+
+        /** Retired single-value placement → flags, used once by [migrateEnhancementIndicatorAxes]. */
+        fun placementFlagsForLegacyPlacement(value: Int): Int = when (value) {
+            LEGACY_PLACEMENT_LEFT -> INDICATOR_PLACEMENT_LEFT
+            LEGACY_PLACEMENT_RIGHT -> INDICATOR_PLACEMENT_RIGHT
+            LEGACY_PLACEMENT_ALL -> INDICATOR_PLACEMENT_LEFT or INDICATOR_PLACEMENT_PAGE_NUMBER
+            else -> INDICATOR_PLACEMENT_PAGE_NUMBER
+        }
+
+        /** Legacy mode → visibility, used once by [migrateEnhancementIndicatorAxes]. */
+        fun indicatorVisibleForLegacyMode(mode: Int): Boolean = mode != INDICATOR_MODE_HIDDEN
+
+        /** Legacy mode → text style, used once by [migrateEnhancementIndicatorAxes]. */
+        fun indicatorStyleForLegacyMode(mode: Int): Int =
+            if (mode == INDICATOR_MODE_BADGE_NUMERIC || mode == INDICATOR_MODE_BOTH_NUMERIC) {
+                INDICATOR_STYLE_NUMERIC
+            } else {
+                INDICATOR_STYLE_TEXT
+            }
+
+        /** Download-then-prewarm choices, see [prewarmAfterDownload]. */
+        const val PREWARM_AFTER_DOWNLOAD_ASK = 0
+        const val PREWARM_AFTER_DOWNLOAD_ALWAYS = 1
+        const val PREWARM_AFTER_DOWNLOAD_NEVER = 2
+
+        /** Performance usage indicator modes, see [performanceUsageMode]. */
+        const val PERFORMANCE_USAGE_HIDDEN = 0
+
+        /** Retired: used to mean "only while enhancing". Kept so stored values stay readable. */
+        const val PERFORMANCE_USAGE_LEGACY_ENHANCING = 1
+        const val PERFORMANCE_USAGE_ALWAYS = 2
+
+        /** Whether [mode] asks for the panels at all; every non-hidden value counts as shown. */
+        fun showsPerformancePanels(mode: Int): Boolean = mode != PERFORMANCE_USAGE_HIDDEN
+
+        /** Enhancement badge text sizes, see [enhancementBadgeSize]. */
+        const val BADGE_SIZE_SMALL = 0
+        const val BADGE_SIZE_MEDIUM = 1
+        const val BADGE_SIZE_LARGE = 2
+
+        /** Enhancement badge font weights, see [enhancementBadgeWeight]. */
+        const val BADGE_WEIGHT_NORMAL = 0
+        const val BADGE_WEIGHT_MEDIUM = 1
+        const val BADGE_WEIGHT_BOLD = 2
+
+        /**
+         * Badge offsets from the chosen corner, in dp, see [enhancementBadgeOffsetX].
+         *
+         * Horizontal is measured from the badge's own side, so the default keeps the same visual
+         * inset in either corner. Vertical 0 puts its bottom edge on the page number's line.
+         * Both defaults must stay inside [BADGE_OFFSET_MIN]..[BADGE_OFFSET_MAX].
+         */
+        const val BADGE_OFFSET_X_DEFAULT = 40
+        const val BADGE_OFFSET_Y_DEFAULT = 0
+        const val BADGE_OFFSET_MIN = 0
+        const val BADGE_OFFSET_MAX = 120
+
+        /** Slider granularity of the two offsets, in dp. */
+        const val BADGE_OFFSET_STEP = 2
+
+        /** Discrete positions the offset sliders expose, as Material3's `steps` argument. */
+        const val BADGE_OFFSET_STEPS = (BADGE_OFFSET_MAX - BADGE_OFFSET_MIN) / BADGE_OFFSET_STEP - 1
+
+        /**
+         * Keeps a stored offset inside the slider's range.
+         *
+         * Stored values outlive the build that wrote them, so a reading is clamped instead of
+         * trusted: an offset beyond the range would push the badge off screen with no way back.
+         */
+        fun clampBadgeOffset(value: Int): Int = value.coerceIn(BADGE_OFFSET_MIN, BADGE_OFFSET_MAX)
+
+        /** Performance overlay corners, see [performanceUsagePlacement]. */
+        const val PERFORMANCE_CORNER_LEFT = 0
+        const val PERFORMANCE_CORNER_RIGHT = 1
+
+        /** Readings the performance overlay can draw, see [performanceUsageItems]. */
+        const val PERFORMANCE_ITEM_CPU = 1 shl 0
+        const val PERFORMANCE_ITEM_POWER = 1 shl 1
+        const val PERFORMANCE_ITEM_BATTERY = 1 shl 2
+
+        /** At most this many readings share the overlay; the third one would only clutter it. */
+        const val PERFORMANCE_ITEM_LIMIT = 2
+
+        /** Retired three-way choice, only read by [migratePerformanceUsageItems]. */
+        const val PERFORMANCE_USAGE_CONTENT_BOTH = 0
+        const val PERFORMANCE_USAGE_CONTENT_CPU = 1
+        const val PERFORMANCE_USAGE_CONTENT_POWER = 2
+
+        fun showsCpuReading(items: Int): Boolean = items and PERFORMANCE_ITEM_CPU != 0
+
+        fun showsPowerReading(items: Int): Boolean = items and PERFORMANCE_ITEM_POWER != 0
+
+        fun showsBatteryReading(items: Int): Boolean = items and PERFORMANCE_ITEM_BATTERY != 0
+
+        /**
+         * Applies one tap on a reading chip; null means the tap would exceed [PERFORMANCE_ITEM_LIMIT]
+         * and the caller has to say so instead of changing anything.
+         */
+        fun togglePerformanceItem(items: Int, item: Int): Int? {
+            if (items and item != 0) return items xor item
+            val next = items or item
+            return if (Integer.bitCount(next) > PERFORMANCE_ITEM_LIMIT) null else next
+        }
+
+        /**
+         * Corner the readings use: the one the enhancement status left free.
+         *
+         * While the status sits in a corner the choice is forced, so the two overlays can never
+         * overlap; otherwise the user's own choice applies.
+         */
+        fun performanceCorner(
+            enhancementVisible: Boolean,
+            enhancementPlacement: Int,
+            chosen: Int,
+        ): Int = when {
+            !enhancementVisible -> chosen
+            drawsLeftBadge(enhancementPlacement) -> PERFORMANCE_CORNER_RIGHT
+            drawsRightBadge(enhancementPlacement) -> PERFORMANCE_CORNER_LEFT
+            else -> chosen
+        }
+
+        /** Retired content choice → item flags, used once by [migratePerformanceUsageItems]. */
+        fun performanceItemsForLegacyContent(content: Int): Int = when (content) {
+            PERFORMANCE_USAGE_CONTENT_CPU -> PERFORMANCE_ITEM_CPU
+            PERFORMANCE_USAGE_CONTENT_POWER -> PERFORMANCE_ITEM_POWER
+            else -> PERFORMANCE_ITEM_CPU or PERFORMANCE_ITEM_POWER
+        }
+
+        /** How much smaller two readings are drawn than one, in sp. */
+        const val PERFORMANCE_TWO_ITEM_TEXT_DROP = 2f
+
+        /** Floor for the shrunken pair, so the numbers stay legible. */
+        const val PERFORMANCE_MIN_TEXT_SP = 9f
+
+        /**
+         * Text size (sp) of the readings overlay.
+         *
+         * One reading keeps the size the user picked, which is also what the status badge uses.
+         * Two share a single row, so they are drawn slightly smaller to stay clear of the page
+         * number.
+         */
+        fun performanceTextSizeSp(size: Int, readings: Int): Float {
+            val base = when (size) {
+                BADGE_SIZE_SMALL -> 11f
+                BADGE_SIZE_LARGE -> 16f
+                else -> 13f
+            }
+            return if (readings > 1) {
+                (base - PERFORMANCE_TWO_ITEM_TEXT_DROP).coerceAtLeast(PERFORMANCE_MIN_TEXT_SP)
+            } else {
+                base
+            }
+        }
 
         /**
          * Maps the retired "badge visibility + page number marker" pair onto the four modes.

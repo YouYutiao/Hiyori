@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.util.waifu2x
 
 import dev.icerock.moko.resources.StringResource
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import tachiyomi.i18n.MR
 
 /**
@@ -28,22 +29,24 @@ object EnhancementStatusBus {
     val states = MutableStateFlow<Map<Pair<Long, Int>, PageEnhanceState>>(emptyMap())
 
     /** Chapter of the most recent publish; drives [stateFor] lookups from the overlay. */
+    @Volatile
     private var currentChapterId: Long = -1L
 
     fun publish(chapterId: Long, pageIndex: Int, state: PageEnhanceState?) {
         currentChapterId = chapterId
         if (pageIndex < 0 || chapterId == -1L) return
         val key = chapterId to pageIndex
-        states.value = states.value.toMutableMap().apply {
+        // Published from the page views, which run on both the main thread and IO; an update loop
+        // keeps two simultaneous writers (a webtoon page has several) from losing each other's entry.
+        states.update { current ->
+            val next = current.toMutableMap()
             when (state) {
-                null -> remove(key)
-                else -> if (get(key) != state) put(key, state)
+                null -> next.remove(key)
+                else -> if (next[key] != state) next[key] = state
             }
-        }
-        // Bound pages refresh their entries on selection; entries older than the current
-        // chapter are dead weight once the transition finishes.
-        if (states.value.size > 64) {
-            states.value = states.value.filterKeys { it.first == chapterId }
+            // Bound pages refresh their entries on selection; entries older than the current
+            // chapter are dead weight once the transition finishes.
+            if (next.size > 64) next.filterKeys { it.first == chapterId } else next
         }
     }
 

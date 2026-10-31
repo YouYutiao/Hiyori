@@ -203,7 +203,7 @@ class WebtoonConfig(
 
         readerPreferences.realCuganPrecision().changes()
             .drop(1)
-            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganPrecision changed") }
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.restartNative("realCuganPrecision changed") }
             .debounce(500)
             .onEach {
                 eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
@@ -213,7 +213,9 @@ class WebtoonConfig(
 
         readerPreferences.realCuganProcessingBackend().changes()
             .drop(1)
-            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganProcessingBackend changed") }
+            .onEach {
+                eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.restartNative("realCuganProcessingBackend changed")
+            }
             .debounce(500)
             .onEach {
                 eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache.clear(appContext)
@@ -223,7 +225,7 @@ class WebtoonConfig(
 
         readerPreferences.realCuganFp16Arithmetic().changes()
             .drop(1)
-            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.cancelAll("realCuganFp16Arithmetic changed") }
+            .onEach { eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer.restartNative("realCuganFp16Arithmetic changed") }
             .debounce(500)
             .onEach {
                 imagePropertyChangedListener?.invoke()

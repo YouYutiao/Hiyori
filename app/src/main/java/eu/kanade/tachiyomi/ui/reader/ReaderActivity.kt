@@ -32,6 +32,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -54,10 +55,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
 import androidx.core.net.toUri
@@ -76,6 +82,7 @@ import eu.kanade.presentation.reader.ReaderContentOverlay
 import eu.kanade.presentation.reader.ReaderEnhancementStatusIndicator
 import eu.kanade.presentation.reader.ReaderPageActionsDialog
 import eu.kanade.presentation.reader.ReaderPageIndicator
+import eu.kanade.presentation.reader.ReaderPerformanceUsageIndicator
 import eu.kanade.presentation.reader.ReadingModeSelectDialog
 import eu.kanade.presentation.reader.appbars.ReaderAppBars
 import eu.kanade.presentation.reader.components.ChapterNavigatorType
@@ -109,6 +116,8 @@ import eu.kanade.tachiyomi.ui.reader.viewer.pager.R2LPagerViewer
 import eu.kanade.tachiyomi.ui.reader.viewer.webgpu.WebGpuViewer
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
 import eu.kanade.tachiyomi.util.mediatek.MediaTekNpu
+import eu.kanade.tachiyomi.util.system.PowerUsageSampler
+import eu.kanade.tachiyomi.util.system.ProcessCpuSampler
 import eu.kanade.tachiyomi.util.system.openInBrowser
 import eu.kanade.tachiyomi.util.system.readerBackgroundColor
 import eu.kanade.tachiyomi.util.system.toShareIntent
@@ -347,7 +356,9 @@ class ReaderActivity : BaseActivity() {
     private fun ReaderActivityBinding.setComposeOverlay(): Unit = composeOverlay.setComposeContent {
         val state by viewModel.state.collectAsState()
         val showPageNumber by readerPreferences.showPageNumber.collectAsState()
-        val indicatorMode by readerPreferences.enhancementIndicatorMode().collectAsState()
+        val indicatorVisible by readerPreferences.enhancementIndicatorVisible().collectAsState()
+        val indicatorPlacement by readerPreferences.enhancementIndicatorPlacement().collectAsState()
+        val indicatorStyle by readerPreferences.enhancementIndicatorStyle().collectAsState()
         val settingsviewModel = remember {
             ReaderSettingsViewModel(
                 readerState = viewModel.state,
@@ -355,7 +366,6 @@ class ReaderActivity : BaseActivity() {
                 onChangeOrientation = viewModel::setMangaOrientationType,
                 onChangeDoublePageShift = viewModel::setDoublePageShift,
                 preferences = readerPreferences,
-                prewarmManager = prewarmManager,
             )
         }
 
@@ -363,12 +373,13 @@ class ReaderActivity : BaseActivity() {
             val enhanceStates by EnhancementStatusBus.states.collectAsState()
             val currentPageEnhanceState = EnhancementStatusBus.stateFor(state.currentPage)
 
-            // The four display modes are two independent flags; deriving them once keeps the
-            // page number marker and the corner badge in sync with the single radio choice.
-            val starEnabled = indicatorMode == ReaderPreferences.INDICATOR_MODE_PAGE_NUMBER ||
-                indicatorMode == ReaderPreferences.INDICATOR_MODE_BOTH
-            val badgeEnabled = indicatorMode == ReaderPreferences.INDICATOR_MODE_BADGE ||
-                indicatorMode == ReaderPreferences.INDICATOR_MODE_BOTH
+            // Visibility, placement and style are three independent choices; deriving them once
+            // keeps the page number marker and both corner badges in sync with the same settings.
+            val starEnabled = indicatorVisible && ReaderPreferences.marksPageNumber(indicatorPlacement)
+            val leftBadgeEnabled = indicatorVisible && ReaderPreferences.drawsLeftBadge(indicatorPlacement)
+            val rightBadgeEnabled = indicatorVisible && ReaderPreferences.drawsRightBadge(indicatorPlacement)
+            val badgeEnabled = leftBadgeEnabled || rightBadgeEnabled
+            val numericBadge = indicatorStyle == ReaderPreferences.INDICATOR_STYLE_NUMERIC
 
             if (!state.menuVisible && showPageNumber) {
                 ReaderPageIndicator(
@@ -382,25 +393,128 @@ class ReaderActivity : BaseActivity() {
             }
 
             // Screen-anchored enhancement status of the current page; always one of the three
-            // states while reading (no auto-hide), offset from the corner by safe insets plus
-            // margins so rounded corners and cutouts never cover it.
+            // states while reading (no auto-hide). Each badge keeps its corner; the offsets only
+            // nudge it from there, and the defaults put its bottom edge on the page number's line.
+            val badgeSize by readerPreferences.enhancementBadgeSize().collectAsState()
+            val badgeWeight by readerPreferences.enhancementBadgeWeight().collectAsState()
+            val badgeOffsetX by readerPreferences.enhancementBadgeOffsetX().collectAsState()
+            val badgeOffsetY by readerPreferences.enhancementBadgeOffsetY().collectAsState()
+            // One typography and one inset for both overlays, so they read as one family.
+            val overlayFontSize = when (badgeSize) {
+                ReaderPreferences.BADGE_SIZE_SMALL -> 11.sp
+                ReaderPreferences.BADGE_SIZE_LARGE -> 16.sp
+                else -> 13.sp
+            }
+            val overlayFontWeight = when (badgeWeight) {
+                ReaderPreferences.BADGE_WEIGHT_NORMAL -> FontWeight.Normal
+                ReaderPreferences.BADGE_WEIGHT_BOLD -> FontWeight.Bold
+                else -> FontWeight.Medium
+            }
+            val overlayInset = ReaderPreferences.clampBadgeOffset(badgeOffsetX).dp
             if (!state.menuVisible && badgeEnabled) {
-                val label = when (val enhanceState = currentPageEnhanceState) {
-                    null, PageEnhanceState.Raw -> stringResource(MR.strings.reader_status_raw)
-                    else -> {
-                        val (res, arg) = enhanceState.label()
-                        if (arg != null) stringResource(res, arg) else stringResource(res)
+                val label = if (numericBadge) {
+                    currentPageEnhanceState?.numericLabel(this@ReaderActivity)
+                        ?: stringResource(MR.strings.reader_status_raw)
+                } else {
+                    when (val enhanceState = currentPageEnhanceState) {
+                        null, PageEnhanceState.Raw -> stringResource(MR.strings.reader_status_raw)
+                        else -> {
+                            val (res, arg) = enhanceState.label()
+                            if (arg != null) stringResource(res, arg) else stringResource(res)
+                        }
                     }
                 }
-                ReaderEnhancementStatusIndicator(
-                    label = label,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .safeDrawingPadding()
-                        .padding(start = 20.dp, bottom = 20.dp)
-                        // Announced when the state changes, so the badge is usable without sight.
-                        .semantics { liveRegion = LiveRegionMode.Polite },
+                if (leftBadgeEnabled) {
+                    EnhancementStatusBadge(
+                        label = label,
+                        alignment = Alignment.BottomStart,
+                        fromStart = true,
+                        inset = overlayInset,
+                        verticalOffset = badgeOffsetY,
+                        fontSize = overlayFontSize,
+                        fontWeight = overlayFontWeight,
+                    )
+                }
+                if (rightBadgeEnabled) {
+                    EnhancementStatusBadge(
+                        label = label,
+                        alignment = Alignment.BottomEnd,
+                        fromStart = false,
+                        inset = overlayInset,
+                        verticalOffset = badgeOffsetY,
+                        fontSize = overlayFontSize,
+                        fontWeight = overlayFontWeight,
+                    )
+                }
+            }
+
+            // Readings drawn as the same outlined text as the status badge. The corner is the one
+            // the status indicator left free, so the two overlays can never sit on top of each
+            // other; when nothing else is shown the user's own choice applies.
+            val performanceUsageMode by readerPreferences.performanceUsageMode().collectAsState()
+            val performanceUsagePlacement by readerPreferences.performanceUsagePlacement().collectAsState()
+            val performanceUsageItems by readerPreferences.performanceUsageItems().collectAsState()
+            val performanceUsageSize by readerPreferences.performanceUsageSize().collectAsState()
+            val performanceUsageWeight by readerPreferences.performanceUsageWeight().collectAsState()
+            val performanceUsageOffsetX by readerPreferences.performanceUsageOffsetX().collectAsState()
+            val performanceUsageOffsetY by readerPreferences.performanceUsageOffsetY().collectAsState()
+            val showPerformanceUsage = !state.menuVisible &&
+                ReaderPreferences.showsPerformancePanels(performanceUsageMode)
+            if (showPerformanceUsage) {
+                val showCpu = ReaderPreferences.showsCpuReading(performanceUsageItems)
+                val showPower = ReaderPreferences.showsPowerReading(performanceUsageItems)
+                val showBattery = ReaderPreferences.showsBatteryReading(performanceUsageItems)
+                val sample = rememberPerformanceUsage(
+                    showCpu = showCpu,
+                    showPower = showPower,
+                    showBattery = showBattery,
                 )
+                // Only readings with a value: unlike the old plates there is no space to reserve,
+                // and a line that is not there yet simply appears a second later.
+                val readings = buildList {
+                    if (showCpu && sample.cpuPercent != null) {
+                        add(stringResource(MR.strings.reader_performance_usage_label, sample.cpuPercent))
+                    }
+                    if (showPower && sample.watts != null) {
+                        add(stringResource(MR.strings.reader_power_usage_label, sample.watts))
+                    }
+                    if (showBattery && sample.batteryPercent != null) {
+                        add(stringResource(MR.strings.reader_battery_usage_label, sample.batteryPercent))
+                    }
+                }
+                if (readings.isNotEmpty()) {
+                    val onLeft = ReaderPreferences.performanceCorner(
+                        enhancementVisible = indicatorVisible,
+                        enhancementPlacement = indicatorPlacement,
+                        chosen = performanceUsagePlacement,
+                    ) == ReaderPreferences.PERFORMANCE_CORNER_LEFT
+                    val inset = ReaderPreferences.clampBadgeOffset(performanceUsageOffsetX).dp
+                    // Two readings share one row, so they are drawn smaller than a single one; the
+                    // single-reading size is the one the status badge uses.
+                    val readingFontSize = ReaderPreferences.performanceTextSizeSp(
+                        size = performanceUsageSize,
+                        readings = readings.size,
+                    ).sp
+                    val readingFontWeight = when (performanceUsageWeight) {
+                        ReaderPreferences.BADGE_WEIGHT_NORMAL -> FontWeight.Normal
+                        ReaderPreferences.BADGE_WEIGHT_BOLD -> FontWeight.Bold
+                        else -> FontWeight.Medium
+                    }
+                    ReaderPerformanceUsageIndicator(
+                        readings = readings,
+                        fontSize = readingFontSize,
+                        fontWeight = readingFontWeight,
+                        modifier = Modifier
+                            .align(if (onLeft) Alignment.BottomStart else Alignment.BottomEnd)
+                            .navigationBarsPadding()
+                            .padding(
+                                start = if (onLeft) inset else 0.dp,
+                                end = if (onLeft) 0.dp else inset,
+                                bottom = ReaderPreferences.clampBadgeOffset(performanceUsageOffsetY).dp,
+                            )
+                            .semantics { liveRegion = LiveRegionMode.Polite },
+                    )
+                }
             }
 
             // A chapter that a prewarm run finished needs a one-shot explanation when neither
@@ -410,7 +524,14 @@ class ReaderActivity : BaseActivity() {
             var showPrewarmAttribution by remember(currentChapterId) { mutableStateOf(false) }
             // showPageNumber is a key: the eligibility below reads it, so toggling page numbers
             // mid-chapter must restart this effect (star appearing/disappearing changes eligibility).
-            LaunchedEffect(currentChapterId, indicatorMode, showPageNumber, prewarmedChapterIds) {
+            LaunchedEffect(
+                currentChapterId,
+                indicatorVisible,
+                indicatorPlacement,
+                indicatorStyle,
+                showPageNumber,
+                prewarmedChapterIds,
+            ) {
                 showPrewarmAttribution = false
                 if (currentChapterId == null) return@LaunchedEffect
                 val starVisible = starEnabled && showPageNumber
@@ -1506,4 +1627,106 @@ class ReaderActivity : BaseActivity() {
             binding.viewerContainer.setLayerType(LAYER_TYPE_HARDWARE, paint)
         }
     }
+}
+
+/**
+ * Percentage form of the corner badge: a finished page reads 100%, a page that is not enhanced
+ * keeps its word (there is no meaningful percentage for "raw"), and a running page shows the work
+ * it has already done.
+ */
+private fun PageEnhanceState.numericLabel(context: android.content.Context): String = when (this) {
+    // The numeric mode only replaces the *running* part with a percentage; the finished and
+    // not-started states read exactly like the text mode, so both modes are recognisable.
+    PageEnhanceState.Enhanced -> context.stringResource(MR.strings.reader_status_processed)
+    PageEnhanceState.Raw -> context.stringResource(MR.strings.reader_status_raw)
+    is PageEnhanceState.Processing -> when (phase) {
+        PageEnhanceState.Processing.Phase.QUEUED -> context.stringResource(MR.strings.reader_status_queued)
+        PageEnhanceState.Processing.Phase.ENHANCING -> progress?.let { "${it.coerceIn(0, 100)}%" }
+            ?: context.stringResource(MR.strings.reader_status_enhancing)
+        // The pixels are computed but the cache entry is still being written, and the page-number
+        // star only appears once the swap is done. Showing 100% here made the badge claim a
+        // finished page while the star was still missing.
+        PageEnhanceState.Processing.Phase.FINISHING -> progress?.let { "${it.coerceIn(0, 99)}%" } ?: "99%"
+    }
+}
+
+/** CPU use, power draw and battery level of the moment; null means "no reading yet". */
+private data class PerformanceSample(
+    val cpuPercent: Int?,
+    val watts: Float?,
+    val batteryPercent: Int?,
+)
+
+/**
+ * Samples the app's CPU usage, the device's power draw and its battery level once a second while
+ * the readings are on screen.
+ *
+ * Only what is actually drawn is sampled: a hidden reading would cost a battery broadcast every
+ * second for a number nobody sees. The samplers live in the effect rather than in the activity, so
+ * leaving the reader, hiding the menu or switching the readings off cancels them. The first values
+ * arrive after one interval, which is why the caller only draws non-null ones.
+ */
+@Composable
+private fun rememberPerformanceUsage(
+    showCpu: Boolean,
+    showPower: Boolean,
+    showBattery: Boolean,
+): PerformanceSample {
+    val context = LocalContext.current
+    // Keyed on the choice: switching readings must not carry the previous value across.
+    var sample by remember(showCpu, showPower, showBattery) {
+        mutableStateOf(PerformanceSample(null, null, null))
+    }
+    LaunchedEffect(showCpu, showPower, showBattery) {
+        val cpuSampler = if (showCpu) ProcessCpuSampler() else null
+        // The level comes from the same battery manager as the wattage, so one sampler serves both.
+        val powerSampler = if (showPower || showBattery) PowerUsageSampler(context) else null
+        while (true) {
+            val cpuPercent = cpuSampler?.sample()
+            val watts = if (showPower) powerSampler?.sampleWatts() else null
+            val level = if (showBattery) powerSampler?.batteryPercent() else null
+            sample = PerformanceSample(
+                cpuPercent = cpuPercent ?: sample.cpuPercent,
+                watts = watts ?: sample.watts,
+                batteryPercent = level ?: sample.batteryPercent,
+            )
+            delay(1_000)
+        }
+    }
+    return sample
+}
+
+/**
+ * One corner badge of the enhancement status.
+ *
+ * The badge is anchored to its corner; [inset] is measured from that same side, so the same setting
+ * keeps the same inset on the left and on the right, and increasing it always moves the badge
+ * towards the page number. The vertical offset lifts it off the page number's line.
+ */
+@Composable
+private fun BoxScope.EnhancementStatusBadge(
+    label: String,
+    alignment: Alignment,
+    fromStart: Boolean,
+    inset: Dp,
+    verticalOffset: Int,
+    fontSize: TextUnit,
+    fontWeight: FontWeight,
+) {
+    ReaderEnhancementStatusIndicator(
+        label = label,
+        fontSize = fontSize,
+        fontWeight = fontWeight,
+        modifier = Modifier
+            .align(alignment)
+            // Same navigation-bar inset as the page number, so both share one line.
+            .navigationBarsPadding()
+            .padding(
+                start = if (fromStart) inset else 0.dp,
+                end = if (fromStart) 0.dp else inset,
+                bottom = ReaderPreferences.clampBadgeOffset(verticalOffset).dp,
+            )
+            // Announced when the state changes, so the badge is usable without sight.
+            .semantics { liveRegion = LiveRegionMode.Polite },
+    )
 }

@@ -305,8 +305,18 @@ open class ReaderPageImageView @JvmOverloads constructor(
      */
     var enhancementStatusPublisher = true
 
+    /**
+     * Receives every state change of this view, including the ones it is not allowed to publish
+     * itself (a webtoon page splits into several views and only the first one controls the page).
+     * The holder uses it to publish one aggregated state per page: the strip the user is looking at
+     * is usually not the first one, and without this its completion was invisible until the page
+     * was re-selected.
+     */
+    var onEnhanceStateChanged: ((PageEnhanceState?) -> Unit)? = null
+
     private fun updateEnhanceState(state: PageEnhanceState?) {
         lastEnhanceState = state
+        onEnhanceStateChanged?.invoke(state)
         if (!enhancementStatusPublisher || !controlsCurrentPageSelection) return
         val chapter = readerPage?.chapter?.chapter?.id ?: chapterId
         val pageIdx = readerPage?.index ?: pageIndex
@@ -411,8 +421,15 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     original.close()
                     return@withUIContext
                 }
-                prepareNonAnimatedImageView()
-                setNonAnimatedImage(original, displayConfig, originalStreamFn, allowEnhancement = retryEnhancement)
+                if (isWebtoon) {
+                    // A segment draws itself as strips; swapping in the pager's pannable view here
+                    // would replace a slice of a tall page with a shrunk full-page view.
+                    prepareStripImageView()
+                    setStripImage(original, displayConfig)
+                } else {
+                    prepareNonAnimatedImageView()
+                    setNonAnimatedImage(original, displayConfig, originalStreamFn, allowEnhancement = retryEnhancement)
+                }
                 if (!retryEnhancement) updateEnhanceState(PageEnhanceState.Raw)
             }
         }
@@ -1157,6 +1174,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
         hasDisplayedImage = false
         pendingInitialEnhancement = null
         updateEnhanceState(null)
+        onEnhanceStateChanged = null
         currentCachedFile = null
         originalStreamFn = null
         clearProcessedSwapView()

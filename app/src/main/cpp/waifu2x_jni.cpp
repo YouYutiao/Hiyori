@@ -190,8 +190,12 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInit(JNIEnv *env,
 
   ncnn::create_gpu_instance();
 
+  // Null after delete: every rebuild below can fail (model load, Vulkan pipeline
+  // creation, allocation). Leaving a freed pointer here makes the *next* init or
+  // nativeDestroy delete it again, which is a native crash rather than a failed page.
   if (g_waifu2x) {
     delete g_waifu2x;
+    g_waifu2x = nullptr;
   }
 
   const char *model_dir_str = env->GetStringUTFChars(model_dir, 0);
@@ -228,6 +232,14 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInit(JNIEnv *env,
 
   int ret = g_waifu2x->load(param_file, bin_file);
 
+  // A failed rebuild must release the half-built net and clear the global: the backend
+  // teardown for the previous session (QNN -> Vulkan) is exactly where this fails, and a
+  // stale pointer turns the retry into a double free.
+  if (ret != 0 && g_waifu2x) {
+    delete g_waifu2x;
+    g_waifu2x = nullptr;
+  }
+
   env->ReleaseStringUTFChars(model_dir, model_dir_str);
   return ret == 0 ? JNI_TRUE : JNI_FALSE;
 }
@@ -247,8 +259,12 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitWaifu2xUpconv7(
 
   ncnn::create_gpu_instance();
 
+  // Null after delete: every rebuild below can fail (model load, Vulkan pipeline
+  // creation, allocation). Leaving a freed pointer here makes the *next* init or
+  // nativeDestroy delete it again, which is a native crash rather than a failed page.
   if (g_waifu2x) {
     delete g_waifu2x;
+    g_waifu2x = nullptr;
   }
 
   const char *model_dir_str = env->GetStringUTFChars(model_dir, 0);
@@ -282,6 +298,14 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitWaifu2xUpconv7(
   g_progress.store(0);
 
   int ret = g_waifu2x->load(param_file, bin_file);
+
+  // A failed rebuild must release the half-built net and clear the global: the backend
+  // teardown for the previous session (QNN -> Vulkan) is exactly where this fails, and a
+  // stale pointer turns the retry into a double free.
+  if (ret != 0 && g_waifu2x) {
+    delete g_waifu2x;
+    g_waifu2x = nullptr;
+  }
 
   env->ReleaseStringUTFChars(model_dir, model_dir_str);
   return ret == 0 ? JNI_TRUE : JNI_FALSE;
@@ -669,8 +693,12 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealCugan(
 
   ncnn::create_gpu_instance();
 
+  // Null after delete: every rebuild below can fail (model load, Vulkan pipeline
+  // creation, allocation). Leaving a freed pointer here makes the *next* init or
+  // nativeDestroy delete it again, which is a native crash rather than a failed page.
   if (g_waifu2x) {
     delete g_waifu2x;
+    g_waifu2x = nullptr;
   }
 
   const char *model_dir_str = env->GetStringUTFChars(model_dir, 0);
@@ -732,6 +760,14 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealCugan(
 
   int ret = g_waifu2x->load(param_file, bin_file);
 
+  // A failed rebuild must release the half-built net and clear the global: the backend
+  // teardown for the previous session (QNN -> Vulkan) is exactly where this fails, and a
+  // stale pointer turns the retry into a double free.
+  if (ret != 0 && g_waifu2x) {
+    delete g_waifu2x;
+    g_waifu2x = nullptr;
+  }
+
   if (ret != 0) {
     LOGE("Real-CUGAN load failed. ret=%d", ret);
     LOGE("Param path: %s", param_file.c_str());
@@ -768,8 +804,12 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealESRGAN(
 
   ncnn::create_gpu_instance();
 
+  // Null after delete: every rebuild below can fail (model load, Vulkan pipeline
+  // creation, allocation). Leaving a freed pointer here makes the *next* init or
+  // nativeDestroy delete it again, which is a native crash rather than a failed page.
   if (g_waifu2x) {
     delete g_waifu2x;
+    g_waifu2x = nullptr;
   }
 
   const char *model_dir_str = env->GetStringUTFChars(model_dir, 0);
@@ -793,6 +833,14 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealESRGAN(
   g_progress.store(0);
 
   int ret = g_waifu2x->load(param_file, bin_file);
+
+  // A failed rebuild must release the half-built net and clear the global: the backend
+  // teardown for the previous session (QNN -> Vulkan) is exactly where this fails, and a
+  // stale pointer turns the retry into a double free.
+  if (ret != 0 && g_waifu2x) {
+    delete g_waifu2x;
+    g_waifu2x = nullptr;
+  }
 
   if (ret != 0) {
     LOGE("Real-ESRGAN init failed: %s", param_file.c_str());
@@ -820,8 +868,12 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitW2xEx(
 
   ncnn::create_gpu_instance();
 
+  // Null after delete: every rebuild below can fail (model load, Vulkan pipeline
+  // creation, allocation). Leaving a freed pointer here makes the *next* init or
+  // nativeDestroy delete it again, which is a native crash rather than a failed page.
   if (g_waifu2x) {
     delete g_waifu2x;
+    g_waifu2x = nullptr;
   }
 
   const char *model_dir_str = env->GetStringUTFChars(model_dir, 0);
@@ -843,6 +895,14 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitW2xEx(
   g_progress.store(0);
 
   int ret = g_waifu2x->load(param_file, bin_file);
+
+  // A failed rebuild must release the half-built net and clear the global: the backend
+  // teardown for the previous session (QNN -> Vulkan) is exactly where this fails, and a
+  // stale pointer turns the retry into a double free.
+  if (ret != 0 && g_waifu2x) {
+    delete g_waifu2x;
+    g_waifu2x = nullptr;
+  }
 
   if (ret != 0) {
     LOGE("Generic ncnn model init failed: %s", param_file.c_str());
@@ -866,8 +926,12 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitNose(
 
   ncnn::create_gpu_instance();
 
+  // Null after delete: every rebuild below can fail (model load, Vulkan pipeline
+  // creation, allocation). Leaving a freed pointer here makes the *next* init or
+  // nativeDestroy delete it again, which is a native crash rather than a failed page.
   if (g_waifu2x) {
     delete g_waifu2x;
+    g_waifu2x = nullptr;
   }
 
   const char *model_dir_str = env->GetStringUTFChars(model_dir, 0);
@@ -888,6 +952,14 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitNose(
   g_progress.store(0);
 
   int ret = g_waifu2x->load(param_file, bin_file);
+
+  // A failed rebuild must release the half-built net and clear the global: the backend
+  // teardown for the previous session (QNN -> Vulkan) is exactly where this fails, and a
+  // stale pointer turns the retry into a double free.
+  if (ret != 0 && g_waifu2x) {
+    delete g_waifu2x;
+    g_waifu2x = nullptr;
+  }
 
   env->ReleaseStringUTFChars(model_dir, model_dir_str);
   return ret == 0 ? JNI_TRUE : JNI_FALSE;

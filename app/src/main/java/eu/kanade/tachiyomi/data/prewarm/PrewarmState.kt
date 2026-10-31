@@ -74,6 +74,15 @@ enum class PrewarmSort {
     QUEUED,
     CHAPTER_ASC,
     CHAPTER_DESC,
+    ;
+
+    companion object {
+        /**
+         * Reads a persisted mode by name. Unknown names - a mode that was removed, a file written
+         * by a newer build - fall back to [CUSTOM], which never reorders anything on its own.
+         */
+        fun fromStored(name: String?): PrewarmSort = entries.firstOrNull { it.name == name } ?: CUSTOM
+    }
 }
 
 /** Statuses that still represent pending work in this process. */

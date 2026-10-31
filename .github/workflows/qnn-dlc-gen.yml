@@ -1,0 +1,145 @@
+name: QNN DLC Generation
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Export ONNX and convert FP16 DLCs
+    runs-on: 'ubuntu-22.04'
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout QAIRT SDK package
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ci/qairt-2.49
+          path: sdk-pkg
+          fetch-depth: 1
+
+      - name: Extract QAIRT SDK
+        run: |
+          cat sdk-pkg/qairt-2.49-linux.tar.gz.part-* > "$RUNNER_TEMP/qairt.tar.gz"
+          echo "13b626b237ef131b3a66bc332befc4fdd7f6fb0cc122505431e1516aaadf3a51  $RUNNER_TEMP/qairt.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/qnn"
+          tar -xzf "$RUNNER_TEMP/qairt.tar.gz" -C "$RUNNER_TEMP/qnn"
+          test -x "$RUNNER_TEMP/qnn/bin/x86_64-linux-clang/qairt-converter"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential clang libc++1 libgomp1 libatomic1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install \
+            numpy==1.26.4 \
+            onnx==1.17.0 \
+            packaging==24.0 \
+            pandas==2.3.3 \
+            pyyaml==6.0.3 \
+            tabulate==0.9.0 \
+            spandrel
+
+      - name: Download model weights
+        run: |
+          set -euo pipefail
+          mkdir -p weights/se weights/w2xex onnx dlc
+
+          curl -fL --retry 3 -o weights/realesr-animevideov3.pth \
+            https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth
+          curl -fL --retry 3 -o weights/realesr-general-x4v3.pth \
+            https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
+          curl -fL --retry 3 -o weights/upcunet_v3.py \
+            https://raw.githubusercontent.com/bilibili/ailab/main/Real-CUGAN/upcunet_v3.py
+          curl -fL --retry 3 -o weights/span-nomosuni.pth \
+            https://github.com/Phhofm/models/releases/download/2xNomosUni_span_multijpg_ldl/2xNomosUni_span_multijpg_ldl.pth
+
+          # Official V3 ("latest") torch weights from the Real-CUGAN release;
+          # HF-hosted mirrors reject GitHub runner IPs with 403.
+          curl -fL --retry 3 -o updated_weights.zip \
+            https://github.com/bilibili/ailab/releases/download/Real-CUGAN/updated_weights.zip
+          unzip -q updated_weights.zip -d updated_weights
+          find updated_weights -name 'up2x-latest-*.pth' -exec cp {} weights/se/ \;
+          for v in no-denoise denoise1x denoise2x denoise3x conservative; do
+            test -s "weights/se/up2x-latest-$v.pth"
+          done
+
+          # W2xEX weights are vendored on the ci/qairt-2.49 branch: the HF Xet
+          # CDN rejects GitHub runner IPs with 403 for these files.
+          cp sdk-pkg/Photo-Small-W2xEX.param weights/w2xex/
+          cp sdk-pkg/Photo-Small-W2xEX.bin weights/w2xex/
+
+      - name: Export ONNX models
+        run: |
+          set -euo pipefail
+          python tools/qnn/export_models.py --tile-size 256 --scales 2 \
+            --realesrgan-weights weights/realesr-animevideov3.pth \
+            --realesrgan-general-weights weights/realesr-general-x4v3.pth \
+            --realcugan-source weights/upcunet_v3.py \
+            --realcugan-weights-dir weights/se \
+            --realcugan-pro-model-dir app/src/main/assets/realcugan-pro-models \
+            --span-weights weights/span-nomosuni.pth \
+            --output-dir onnx
+
+          python tools/qnn/export_models.py --tile-size 256 --scales 3 \
+            --realcugan-source weights/upcunet_v3.py \
+            --realcugan-pro-model-dir app/src/main/assets/realcugan-pro-models \
+            --output-dir onnx
+
+          python tools/qnn/export_w2xex_onnx.py \
+            --param weights/w2xex/Photo-Small-W2xEX.param \
+            --weights weights/w2xex/Photo-Small-W2xEX.bin \
+            --output onnx/w2xex-photo-small-x2.onnx \
+            --tile-size 256
+
+          echo "=== exported ONNX ==="
+          ls -la onnx
+          test "$(ls onnx/*.onnx | wc -l)" -eq 15
+
+      - name: Convert to FP16 DLCs
+        run: |
+          set -euo pipefail
+          export QNN_SDK_ROOT="$RUNNER_TEMP/qnn"
+          export PYTHONPATH="$QNN_SDK_ROOT/lib/python${PYTHONPATH:+:$PYTHONPATH}"
+          export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/x86_64-linux-clang${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ONNX_DIR="$PWD/onnx" OUTPUT_DIR="$PWD/dlc" sh tools/qnn/convert_dlc_models.sh
+
+      - name: Verify DLCs
+        run: |
+          set -euo pipefail
+          echo "=== DLC files ==="
+          ls -la dlc/
+          COUNT=$(find dlc -maxdepth 1 -name '*.dlc' | wc -l | tr -d ' ')
+          echo "DLC count: $COUNT"
+          test "$COUNT" -eq 15
+          # Note: dlc-info binaries lose their exec bit in the tarball built on
+          # Windows; full validation happens during on-device context preparation.
+          echo "=== DLC manifest ==="
+          sha256sum dlc/*.dlc | tee dlc/SHA256SUMS
+
+      - name: Upload DLCs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qnn-dlc-fp16
+          path: |
+            dlc/*.dlc
+            dlc/SHA256SUMS
+          if-no-files-found: error

@@ -19,8 +19,10 @@ import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
 import eu.kanade.tachiyomi.util.system.dpToPx
 import eu.kanade.tachiyomi.util.view.isVisibleOnScreen
+import eu.kanade.tachiyomi.util.waifu2x.EnhancementStatusBus
 import eu.kanade.tachiyomi.util.waifu2x.ImageEnhancementCache
 import eu.kanade.tachiyomi.util.waifu2x.ImageEnhancer
+import eu.kanade.tachiyomi.util.waifu2x.PageEnhanceState
 import eu.kanade.tachiyomi.util.waifu2x.PrewarmHitMetrics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -96,6 +98,19 @@ class WebtoonPageHolder(
     private var lastSelectionSequence = -1
 
     /**
+     * Latest state reported by each segment view. A page is several views, so the badge can only
+     * be driven by their aggregate; publishing segment by segment would make it alternate between
+     * "enhancing" and "enhanced" while the same page is still working.
+     */
+    private val segmentStates = mutableMapOf<Int, PageEnhanceState?>()
+
+    /**
+     * Bumped whenever the holder is bound or recycled. A segment callback captured before that
+     * belongs to the previous page and must not publish for the current one.
+     */
+    private var bindGeneration = 0
+
+    /**
      * Page of a chapter.
      */
     private var page: ReaderPage? = null
@@ -122,6 +137,8 @@ class WebtoonPageHolder(
      */
     fun bind(page: ReaderPage) {
         this.page = page
+        bindGeneration++
+        segmentStates.clear()
         frame.pageIndex = page.index
         frame.mangaId = viewer.activity.viewModel.manga?.id ?: -1L
         frame.chapterId = page.chapter.chapter.id ?: -1L
@@ -136,11 +153,12 @@ class WebtoonPageHolder(
     }
 
     /**
-     * Swaps visible segments to their enhanced image the moment the cache entry lands.
-     * Without this, a preloaded-but-not-selected segment only swapped when the user
-     * scrolled it into selection, which read as the enhanced image arriving late.
-     * Off-screen segments stay untouched; the existing selection path swaps them instantly
-     * from cache, and pre-decoding off-screen would double their memory.
+     * Swaps segments to their enhanced image the moment the cache entry lands.
+     *
+     * The window reaches one screen past the viewport on both sides: a segment whose enhancement
+     * finishes just before it scrolls in is decoded then and there, so it arrives already sharp.
+     * Waiting for selection instead (the old behaviour) meant the user saw the original for a
+     * moment, then the swap, because the decode only started once the segment was on screen.
      */
     private fun observeCacheSaves() {
         cacheEventJob?.cancel()
@@ -148,10 +166,53 @@ class WebtoonPageHolder(
             ImageEnhancementCache.events.collect { event ->
                 val saved = event as? ImageEnhancementCache.CacheEvent.Saved ?: return@collect
                 segmentFrames
-                    .filter { it.isVisibleOnScreen() && it.matchesEvent(saved) }
+                    .filter { it.matchesEvent(saved) && it.isWithinPredecodeWindow() }
                     .forEach { it.refreshFromCache() }
             }
         }
+    }
+
+    /**
+     * Whether this segment is close enough to the viewport that decoding its enhanced strips now is
+     * not wasted work. One screen above and one below: the strip one flick away is the one the
+     * reader looks at next, and anything further out would only raise memory use.
+     */
+    private fun ReaderPageImageView.isWithinPredecodeWindow(): Boolean {
+        if (isVisibleOnScreen()) return true
+        if (!isShown) return false
+        val location = IntArray(2)
+        getLocationOnScreen(location)
+        val screenHeight = context.resources.displayMetrics.heightPixels
+        val top = location[1]
+        return top < screenHeight * 2 && top + height > -screenHeight
+    }
+
+    /**
+     * Publishes the page's state as the best state of its segments.
+     *
+     * "Enhanced" only wins once nothing is still processing, so the badge cannot claim a page is
+     * done while one of its strips is still being enhanced; a page where some strips were skipped
+     * still reads as enhanced, because that is how it will look.
+     */
+    private fun onSegmentStateChanged(index: Int, state: PageEnhanceState?) {
+        synchronized(segmentStates) { segmentStates[index] = state }
+        publishAggregatedState()
+    }
+
+    private fun publishAggregatedState() {
+        val page = page ?: return
+        val chapterId = page.chapter.chapter.id ?: return
+        val states = synchronized(segmentStates) { segmentStates.values.filterNotNull() }
+        val aggregate = when {
+            states.isEmpty() -> null
+            states.any { it is PageEnhanceState.Processing } ->
+                states
+                    .filterIsInstance<PageEnhanceState.Processing>()
+                    .maxByOrNull { it.progress ?: -1 }
+            states.any { it == PageEnhanceState.Enhanced } -> PageEnhanceState.Enhanced
+            else -> PageEnhanceState.Raw
+        }
+        EnhancementStatusBus.publish(chapterId, page.index, aggregate)
     }
 
     fun boundPage(): ReaderPage? = page
@@ -164,6 +225,9 @@ class WebtoonPageHolder(
         lastSelectionSequence = selectionSequence
         segmentFrames.forEach { it.onPageSelected(true) }
         pendingSelectionSequence = null
+        // Selecting the page must also refresh the badge: the aggregate may have changed while the
+        // page was off screen and nothing was listening.
+        publishAggregatedState()
     }
 
     fun preloadLeadingSegment() {
@@ -189,6 +253,8 @@ class WebtoonPageHolder(
         loadJob = null
         cacheEventJob?.cancel()
         cacheEventJob = null
+        bindGeneration++
+        synchronized(segmentStates) { segmentStates.clear() }
 
         removeErrorLayout()
         loadedSegments.clear()
@@ -382,12 +448,14 @@ class WebtoonPageHolder(
     private fun bindDisplaySegments(page: ReaderPage, segments: List<DisplaySegment>) {
         ensureSegmentFrames(segments.size)
         loadedSegments.clear()
+        synchronized(segmentStates) { segmentStates.clear() }
 
         val displayConfig = ReaderPageImageView.Config(
             zoomDuration = viewer.config.doubleTapAnimDuration,
             minimumScaleType = SubsamplingScaleImageView.SCALE_TYPE_FIT_WIDTH,
             cropBorders = viewer.config.imageCropBorders,
         )
+        val generation = bindGeneration
 
         segments.forEachIndexed { index, segment ->
             val segmentFrame = segmentFrames[index]
@@ -402,6 +470,13 @@ class WebtoonPageHolder(
             // pruning. Other segments share its page index but must not each claim to be the
             // focused target, otherwise a single tall image floods the high-priority queue.
             segmentFrame.controlsCurrentPageSelection = index == 0
+            // The holder publishes one aggregate for the page instead; every segment reports to it,
+            // so a strip that finishes while the user is looking further down still updates the
+            // badge immediately.
+            segmentFrame.enhancementStatusPublisher = false
+            segmentFrame.onEnhanceStateChanged = { state ->
+                if (generation == bindGeneration) onSegmentStateChanged(index, state)
+            }
             segmentFrame.enhancementVariantOverride = segment.enhancementVariant
             segmentFrame.enhancementStreamOverride = streamFactory
             segmentFrame.suppressDefaultStatus = false

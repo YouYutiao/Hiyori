@@ -154,8 +154,8 @@ android {
     defaultConfig {
         applicationId = "app.hiyori"
 
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 7
+        versionName = "0.1.3"
         buildConfigField("int", "UPSTREAM_VERSION_CODE", "38")
 
         buildConfigField("boolean", "TELEMETRY_INCLUDED", "${Config.includeTelemetry}")

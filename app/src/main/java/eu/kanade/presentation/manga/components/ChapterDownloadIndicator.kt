@@ -1,6 +1,7 @@
 package eu.kanade.presentation.manga.components
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
@@ -19,6 +20,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -35,17 +38,28 @@ import mihon.icons.custommaterialsymbols.rounded.DownloadArrow
 import mihon.icons.custommaterialsymbols.rounded.DownloadCircle
 import mihon.icons.materialsymbols.MaterialSymbols
 import mihon.icons.materialsymbols.rounded.Error
+import mihon.icons.materialsymbols.rounded.RocketLaunch
 import mihon.icons.materialsymbols.roundedfilled.CheckCircle
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.components.material.IconButtonTokens
 import tachiyomi.presentation.core.i18n.stringResource
 import tachiyomi.presentation.core.util.secondaryItemAlpha
+import kotlin.math.ceil
 
 enum class ChapterDownloadAction {
     START,
     START_NOW,
     CANCEL,
     DELETE,
+
+    /** Queue a downloaded chapter for page enhancement. */
+    PREWARM,
+
+    /** Jump a queued chapter to the front and make sure the queue is running. */
+    PREWARM_NOW,
+
+    /** Drop a chapter from the queue without touching what is already cached. */
+    PREWARM_CANCEL,
 }
 
 @Composable
@@ -53,6 +67,8 @@ fun ChapterDownloadIndicator(
     enabled: Boolean,
     downloadStateProvider: () -> Download.State,
     downloadProgressProvider: () -> Int,
+    prewarmProgressProvider: () -> Int? = { null },
+    prewarmed: Boolean = false,
     onClick: (ChapterDownloadAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -69,8 +85,14 @@ fun ChapterDownloadIndicator(
             downloadProgressProvider = downloadProgressProvider,
             onClick = onClick,
         )
-        Download.State.DOWNLOADED -> DownloadedIndicator(
+        // A chapter that is fully downloaded but whose pages are still being enhanced borrows the
+        // same slot: the download icon has nothing left to say, and a second badge next to it made
+        // the row read as two conflicting states.
+        Download.State.DOWNLOADED -> prewarmProgressProvider()?.let { progress ->
+            PrewarmingIndicator(progress = progress, onClick = onClick, modifier = modifier)
+        } ?: DownloadedIndicator(
             enabled = enabled,
+            prewarmed = prewarmed,
             modifier = modifier,
             onClick = onClick,
         )
@@ -194,6 +216,7 @@ private fun DownloadingIndicator(
 @Composable
 private fun DownloadedIndicator(
     enabled: Boolean,
+    prewarmed: Boolean,
     modifier: Modifier = Modifier,
     onClick: (ChapterDownloadAction) -> Unit,
 ) {
@@ -216,10 +239,102 @@ private fun DownloadedIndicator(
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         DropdownMenu(expanded = isMenuExpanded, onDismissRequest = { isMenuExpanded = false }) {
+            // A warmed chapter has nothing left to prewarm, and offering "cancel" next to "delete"
+            // read as two ways of undoing the same thing; it only keeps the delete entry.
+            if (!prewarmed) {
+                DropdownMenuItem(
+                    text = { Text(text = stringResource(MR.strings.prewarm_chapter_start)) },
+                    onClick = {
+                        onClick(ChapterDownloadAction.PREWARM)
+                        isMenuExpanded = false
+                    },
+                )
+            }
             DropdownMenuItem(
                 text = { Text(text = stringResource(MR.strings.action_delete)) },
                 onClick = {
                     onClick(ChapterDownloadAction.DELETE)
+                    isMenuExpanded = false
+                },
+            )
+        }
+    }
+}
+
+/**
+ * Marks a downloaded chapter that is being enhanced right now.
+ *
+ * Deliberately unlike the download ring: a segmented gauge (tick per slice, filled as pages finish)
+ * with a small rocket in the middle. The download ring is a smooth wave, so "still downloading" and
+ * "downloaded, now enhancing" never read alike; the rocket is kept smaller than the ring so the two
+ * do not touch even at the smallest row height.
+ */
+@Composable
+private fun PrewarmingIndicator(
+    progress: Int,
+    onClick: (ChapterDownloadAction) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var isMenuExpanded by remember { mutableStateOf(false) }
+    val animatedProgress by animateFloatAsState(
+        targetValue = progress / 100f,
+        animationSpec = WavyProgressIndicatorDefaults.ProgressAnimationSpec,
+        label = "prewarm-progress",
+    )
+    val color = MaterialTheme.colorScheme.primary
+    val trackColor = color.copy(alpha = TRACK_ALPHA)
+    Box(
+        modifier = modifier
+            .size(IconButtonTokens.StateLayerSize)
+            .commonClickable(
+                enabled = true,
+                hapticFeedback = LocalHapticFeedback.current,
+                // Long press is the queue's own "run it now"; the menu spells it out for people who
+                // never try long presses.
+                onLongClick = { onClick(ChapterDownloadAction.PREWARM_NOW) },
+                onClick = { isMenuExpanded = true },
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(modifier = PrewarmIndicatorModifier) {
+            val stroke = PrewarmStrokeWidth.toPx()
+            val diameter = size.minDimension - stroke
+            val topLeft = Offset((size.width - diameter) / 2f, (size.height - diameter) / 2f)
+            val slice = 360f / PREWARM_SEGMENTS
+            // A whole segment lights up as soon as its share of the progress is reached, so the
+            // gauge steps page by page instead of creeping; rounding up keeps the first page
+            // visible right away.
+            val filled = ceil(animatedProgress.coerceIn(0f, 1f) * PREWARM_SEGMENTS).toInt()
+            for (index in 0 until PREWARM_SEGMENTS) {
+                drawArc(
+                    color = if (index < filled) color else trackColor,
+                    startAngle = -90f + index * slice + PREWARM_SEGMENT_GAP / 2f,
+                    sweepAngle = slice - PREWARM_SEGMENT_GAP,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = Size(diameter, diameter),
+                    style = Stroke(width = stroke, cap = StrokeCap.Round),
+                )
+            }
+        }
+        Icon(
+            imageVector = MaterialSymbols.Rounded.RocketLaunch,
+            contentDescription = stringResource(MR.strings.prewarm_chapter_indicator),
+            modifier = Modifier.size(PrewarmIconSize),
+            tint = color,
+        )
+        DropdownMenu(expanded = isMenuExpanded, onDismissRequest = { isMenuExpanded = false }) {
+            DropdownMenuItem(
+                text = { Text(text = stringResource(MR.strings.prewarm_start_now)) },
+                onClick = {
+                    onClick(ChapterDownloadAction.PREWARM_NOW)
+                    isMenuExpanded = false
+                },
+            )
+            DropdownMenuItem(
+                text = { Text(text = stringResource(MR.strings.action_cancel)) },
+                onClick = {
+                    onClick(ChapterDownloadAction.PREWARM_CANCEL)
                     isMenuExpanded = false
                 },
             )
@@ -280,6 +395,13 @@ private const val INDICATOR_AMPLITUDE = 0.6f
 private const val TRACK_ALPHA = 0.25f
 
 private val IndicatorStrokeWidth = 2.dp
+private val PrewarmStrokeWidth = 2.dp
+private val PrewarmIconSize = 11.dp
+private const val PREWARM_SEGMENTS = 12
+private const val PREWARM_SEGMENT_GAP = 12f
+private val PrewarmIndicatorModifier = Modifier
+    .size(IndicatorSize)
+    .padding(IndicatorPadding)
 
 private val IndicatorModifier = Modifier
     .size(IndicatorSize)

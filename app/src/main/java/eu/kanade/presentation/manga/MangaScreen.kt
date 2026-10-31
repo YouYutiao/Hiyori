@@ -815,6 +815,7 @@ private fun LazyListScope.sharedChapterItems(
                     downloadIndicatorEnabled = !isAnyChapterSelected && !manga.isLocal(),
                     cloudUploaded = item.isUploadedToCloud,
                     isPrewarmed = item.isPrewarmed,
+                    prewarmProgressProvider = { item.prewarmProgress },
                     downloadStateProvider = { item.downloadState },
                     downloadProgressProvider = { downloadProgressProvider(item.id) },
                     chapterSwipeStartAction = chapterSwipeStartAction,

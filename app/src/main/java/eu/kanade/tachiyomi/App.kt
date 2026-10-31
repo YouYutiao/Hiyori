@@ -40,6 +40,7 @@ import eu.kanade.tachiyomi.data.coil.MangaCoverFetcher
 import eu.kanade.tachiyomi.data.coil.MangaCoverKeyer
 import eu.kanade.tachiyomi.data.coil.MangaKeyer
 import eu.kanade.tachiyomi.data.notification.Notifications
+import eu.kanade.tachiyomi.data.prewarm.PrewarmManager
 import eu.kanade.tachiyomi.extension.ExtensionManager
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.NetworkPreferences
@@ -108,6 +109,10 @@ class App : Application(), DefaultLifecycleObserver, SingletonImageLoader.Factor
     @Inject private lateinit var extensionManager: Lazy<ExtensionManager>
 
     @Inject private lateinit var widgetManager: WidgetManager
+
+    // Eager on purpose: the queue left behind by the last session is restored while the app starts,
+    // not when some screen first asks for it, so prewarming can carry on unattended.
+    @Inject private lateinit var prewarmManager: PrewarmManager
 
     @Inject private lateinit var migrations: Set<Migration>
 

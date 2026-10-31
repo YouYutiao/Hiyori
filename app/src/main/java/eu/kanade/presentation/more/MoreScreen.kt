@@ -123,10 +123,6 @@ fun MoreScreen(
                             count = prewarmSummary.active,
                             prewarmSummary.active,
                         )
-                        prewarmSummary.lastChapterCount > 0 -> stringResource(
-                            MR.strings.prewarm_more_last_run,
-                            prewarmSummary.lastChapterCount,
-                        )
                         // Nothing happened yet and nothing is queued: an "idle" line would only
                         // repeat the title back at the user, so the row keeps a single line.
                         else -> null

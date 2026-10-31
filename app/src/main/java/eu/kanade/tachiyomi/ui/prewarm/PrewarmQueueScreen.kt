@@ -2,8 +2,7 @@ package eu.kanade.tachiyomi.ui.prewarm
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,74 +12,70 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SmallExtendedFloatingActionButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.zIndex
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import cafe.adriel.voyager.navigator.LocalNavigator
 import cafe.adriel.voyager.navigator.currentOrThrow
 import dev.zacsweers.metrox.viewmodel.metroViewModel
 import eu.kanade.presentation.components.AppBar
 import eu.kanade.presentation.components.AppBarActions
+import eu.kanade.presentation.components.DropdownMenu
+import eu.kanade.presentation.components.NestedMenuItem
 import eu.kanade.presentation.util.Screen
-import eu.kanade.tachiyomi.data.prewarm.PrewarmCompletionSummary
 import eu.kanade.tachiyomi.data.prewarm.PrewarmItem
 import eu.kanade.tachiyomi.data.prewarm.PrewarmPauseReason
-import eu.kanade.tachiyomi.data.prewarm.PrewarmSessionStats
 import eu.kanade.tachiyomi.data.prewarm.PrewarmSkipReason
 import eu.kanade.tachiyomi.data.prewarm.PrewarmSort
 import eu.kanade.tachiyomi.data.prewarm.PrewarmStatus
 import eu.kanade.tachiyomi.data.prewarm.isActive
 import eu.kanade.tachiyomi.ui.manga.MangaScreen
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
-import kotlinx.coroutines.launch
 import mihon.icons.materialsymbols.MaterialSymbols
 import mihon.icons.materialsymbols.automirroredrounded.Sort
-import mihon.icons.materialsymbols.rounded.Check
 import mihon.icons.materialsymbols.rounded.Close
 import mihon.icons.materialsymbols.rounded.DragHandle
 import mihon.icons.materialsymbols.rounded.LocalLibrary
 import mihon.icons.materialsymbols.rounded.MoreVert
 import mihon.icons.materialsymbols.roundedfilled.Pause
 import mihon.icons.materialsymbols.roundedfilled.PlayArrow
+import sh.calvin.reorderable.ReorderableItem
+import sh.calvin.reorderable.rememberReorderableLazyListState
 import tachiyomi.i18n.MR
+import tachiyomi.presentation.core.components.Pill
 import tachiyomi.presentation.core.components.material.Scaffold
 import tachiyomi.presentation.core.i18n.stringResource
 import tachiyomi.presentation.core.screens.EmptyScreen
@@ -93,16 +88,17 @@ object PrewarmQueueScreen : Screen() {
         val navigator = LocalNavigator.currentOrThrow
         val viewModel = metroViewModel<PrewarmQueueViewModel>()
         val queue by viewModel.queueState.collectAsStateWithLifecycle()
-        val stats by viewModel.stats.collectAsStateWithLifecycle()
         val manualPaused by viewModel.isManualPaused.collectAsStateWithLifecycle()
         val batteryPolicy by viewModel.batteryPolicy.collectAsStateWithLifecycle()
-        val lastCompletion by viewModel.lastCompletion.collectAsStateWithLifecycle()
+        val prewarmAfterDownload by viewModel.prewarmAfterDownload.collectAsStateWithLifecycle()
 
+        // Finished chapters leave the list on their own, the way finished downloads do. They stay in
+        // the manager's state, because the manga list reads its "already warmed" badges from it.
+        val visibleQueue = remember(queue) { queue.filter { it.status != PrewarmStatus.DONE } }
         val activeCount = queue.count { it.status.isActive }
-        // Session state lives in the app bar subtitle instead of a card at the top of the list:
-        // the queue should read as a list of chapters, not as a dashboard.
-        val cardState = prewarmCardState(queue, stats)
-        val statusLine = prewarmStatusLine(cardState, queue, stats, lastCompletion)
+        val waitingForCharge = queue.any {
+            it.status == PrewarmStatus.PAUSED && it.pauseReason == PrewarmPauseReason.WAITING_CHARGE
+        }
         val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior(rememberTopAppBarState())
         var showPolicyDialog by remember { mutableStateOf(false) }
         var fabExpanded by remember { mutableStateOf(true) }
@@ -125,140 +121,126 @@ object PrewarmQueueScreen : Screen() {
             }
         }
 
-        val sortMode by viewModel.sortMode.collectAsStateWithLifecycle()
-        var sortExpanded by remember { mutableStateOf(false) }
-        val rows = remember(queue, stats) { buildRows(queue, stats) }
+        val rows = remember(visibleQueue) { buildRows(visibleQueue) }
         val listState = rememberLazyListState()
+        // The move callback outlives a single recomposition, so it reads the latest rows instead of
+        // the list captured when the drag state was created.
+        val currentRows by rememberUpdatedState(rows)
+        val reorderState = rememberReorderableLazyListState(listState) { from, to ->
+            moveRow(from.index, to.index, currentRows, viewModel)
+        }
         val haptics = LocalHapticFeedback.current
-        val scope = rememberCoroutineScope()
-
-        // One drag session at a time: either a chapter (inside its series) or a series header.
-        var draggedChapterId by remember { mutableStateOf<Long?>(null) }
-        var draggedSourceId by remember { mutableStateOf<Long?>(null) }
-        var dragOffset by remember { mutableFloatStateOf(0f) }
-        var dragAnchorTop by remember { mutableIntStateOf(0) }
-        var dragAnchorHeight by remember { mutableIntStateOf(0) }
-
-        fun beginDrag(key: Any, chapterId: Long?, seriesId: Long?) {
-            val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == key } ?: return
-            dragAnchorTop = info.offset
-            dragAnchorHeight = info.size
-            dragOffset = 0f
-            draggedChapterId = chapterId
-            draggedSourceId = seriesId
-            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-        }
-
-        fun updateDrag(delta: Float) {
-            dragOffset += delta
-            val center = dragAnchorTop + dragOffset + dragAnchorHeight / 2f
-            val layout = listState.layoutInfo
-            // Keep long queues usable: approaching an edge scrolls the list under the finger.
-            when {
-                center < layout.viewportStartOffset + 96f -> scope.launch { listState.scrollBy(-24f) }
-                center > layout.viewportEndOffset - 96f -> scope.launch { listState.scrollBy(24f) }
-            }
-        }
-
-        fun targetKeyUnderFinger(): Any? {
-            val center = dragAnchorTop + dragOffset + dragAnchorHeight / 2f
-            return listState.layoutInfo.visibleItemsInfo
-                .firstOrNull { center >= it.offset && center <= it.offset + it.size }
-                ?.key
-        }
-
-        fun endDrag() {
-            val chapterId = draggedChapterId
-            val seriesId = draggedSourceId
-            val target = targetKeyUnderFinger()
-            when {
-                chapterId != null && target is Long -> {
-                    val item = queue.firstOrNull { it.chapterId == chapterId }
-                    val block = item?.let { current -> queue.filter { it.mangaId == current.mangaId } }
-                    val targetIndex = block?.indexOfFirst { it.chapterId == target } ?: -1
-                    if (targetIndex >= 0) viewModel.moveChapter(chapterId, targetIndex)
-                }
-                seriesId != null && target is String && target.startsWith(HEADER_KEY_PREFIX) -> {
-                    val targetSeries = target.removePrefix(HEADER_KEY_PREFIX).toLongOrNull()
-                    val order = rows.mapNotNull { (it as? PrewarmRow.Header)?.sourceId }
-                    val targetIndex = targetSeries?.let { order.indexOf(it) } ?: -1
-                    if (targetIndex >= 0) viewModel.moveSource(seriesId, targetIndex)
-                }
-            }
-            draggedChapterId = null
-            draggedSourceId = null
-            dragOffset = 0f
-        }
 
         Scaffold(
             topBar = {
                 AppBar(
-                    title = stringResource(MR.strings.label_prewarm_queue),
-                    subtitle = statusLine,
-                    navigateUp = navigator::pop,
-                    scrollBehavior = scrollBehavior,
-                    actions = {
-                        if (queue.isNotEmpty()) {
-                            Box {
-                                IconButton(onClick = { sortExpanded = true }) {
-                                    Icon(
-                                        imageVector = MaterialSymbols.AutoMirroredRounded.Sort,
-                                        contentDescription = stringResource(MR.strings.action_sort),
-                                    )
-                                }
-                                DropdownMenu(
-                                    expanded = sortExpanded,
-                                    onDismissRequest = { sortExpanded = false },
-                                ) {
-                                    PrewarmSort.entries
-                                        .filter { it != PrewarmSort.CUSTOM }
-                                        .forEach { sort ->
-                                            DropdownMenuItem(
-                                                text = { Text(prewarmSortLabel(sort)) },
-                                                leadingIcon = {
-                                                    if (sortMode == sort) {
-                                                        Icon(
-                                                            imageVector = MaterialSymbols.Rounded.Check,
-                                                            contentDescription = null,
-                                                        )
-                                                    }
-                                                },
-                                                onClick = {
-                                                    sortExpanded = false
-                                                    viewModel.sortQueue(sort)
-                                                },
-                                            )
-                                        }
-                                }
+                    titleContent = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = stringResource(MR.strings.label_prewarm_queue),
+                                maxLines = 1,
+                                modifier = Modifier.weight(1f, false),
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (visibleQueue.isNotEmpty()) {
+                                val pillAlpha = if (isSystemInDarkTheme()) 0.12f else 0.08f
+                                Pill(
+                                    text = "${visibleQueue.size}",
+                                    modifier = Modifier.padding(start = 4.dp),
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = pillAlpha),
+                                    fontSize = 14.sp,
+                                )
                             }
                         }
-                        AppBarActions(
-                            actions = buildList {
-                                if (cardState == PrewarmCardState.WAITING_CHARGE) {
-                                    add(
+                    },
+                    navigateUp = navigator::pop,
+                    actions = {
+                        // Sort and cancel only make sense with a queue; the settings entry does
+                        // not, because turning prewarming on is the first thing a new user does.
+                        if (queue.isNotEmpty()) {
+                            var sortExpanded by remember { mutableStateOf(false) }
+                            val onDismissRequest = { sortExpanded = false }
+                            // Same shape as the download queue: grouped sort actions behind one icon.
+                            DropdownMenu(
+                                expanded = sortExpanded,
+                                onDismissRequest = onDismissRequest,
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text(text = stringResource(MR.strings.prewarm_sort_queue_order)) },
+                                    onClick = {
+                                        sortExpanded = false
+                                        viewModel.sortQueue(PrewarmSort.QUEUED)
+                                    },
+                                )
+                                NestedMenuItem(
+                                    text = { Text(text = stringResource(MR.strings.action_order_by_chapter_number)) },
+                                    children = { closeMenu ->
+                                        DropdownMenuItem(
+                                            text = { Text(text = stringResource(MR.strings.action_asc)) },
+                                            onClick = {
+                                                viewModel.sortQueue(PrewarmSort.CHAPTER_ASC)
+                                                closeMenu()
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text(text = stringResource(MR.strings.action_desc)) },
+                                            onClick = {
+                                                viewModel.sortQueue(PrewarmSort.CHAPTER_DESC)
+                                                closeMenu()
+                                            },
+                                        )
+                                    },
+                                )
+                            }
+
+                            AppBarActions(
+                                listOfNotNull(
+                                    AppBar.Action(
+                                        title = stringResource(MR.strings.action_sort),
+                                        icon = MaterialSymbols.AutoMirroredRounded.Sort,
+                                        onClick = { sortExpanded = true },
+                                    ),
+                                    if (waitingForCharge) {
                                         AppBar.OverflowAction(
                                             title = stringResource(MR.strings.prewarm_now),
                                             onClick = viewModel::prewarmNowOnce,
-                                        ),
-                                    )
-                                }
-                                add(
+                                        )
+                                    } else {
+                                        null
+                                    },
                                     AppBar.OverflowAction(
-                                        title = batteryPolicyLabel(batteryPolicy),
+                                        title = stringResource(MR.strings.prewarm_settings),
                                         onClick = { showPolicyDialog = true },
                                     ),
-                                )
-                                if (activeCount > 0) {
-                                    add(
+                                    // Finished chapters stay listed, like finished downloads do, so
+                                    // the run's result remains visible until it is dismissed here.
+                                    if (activeCount > 0) {
                                         AppBar.OverflowAction(
                                             title = stringResource(MR.strings.action_cancel_all),
                                             onClick = viewModel::clearQueue,
-                                        ),
-                                    )
-                                }
-                            },
-                        )
+                                        )
+                                    } else if (visibleQueue.isNotEmpty()) {
+                                        AppBar.OverflowAction(
+                                            title = stringResource(MR.strings.prewarm_clear_finished),
+                                            onClick = viewModel::clearQueue,
+                                        )
+                                    } else {
+                                        null
+                                    },
+                                ),
+                            )
+                        } else {
+                            AppBarActions(
+                                listOf(
+                                    AppBar.OverflowAction(
+                                        title = stringResource(MR.strings.prewarm_settings),
+                                        onClick = { showPolicyDialog = true },
+                                    ),
+                                ),
+                            )
+                        }
                     },
+                    scrollBehavior = scrollBehavior,
                 )
             },
             floatingActionButton = {
@@ -287,13 +269,10 @@ object PrewarmQueueScreen : Screen() {
                 }
             },
         ) { contentPadding ->
-            if (queue.isEmpty()) {
+            if (visibleQueue.isEmpty()) {
                 EmptyScreen(
                     message = stringResource(MR.strings.prewarm_empty_guide),
                     modifier = Modifier.padding(contentPadding),
-                    subtitle = lastCompletion?.let {
-                        stringResource(MR.strings.prewarm_more_last_run, it.chapterCount)
-                    },
                     actions = listOf(
                         EmptyScreenAction(
                             stringRes = MR.strings.prewarm_empty_go_library,
@@ -312,79 +291,52 @@ object PrewarmQueueScreen : Screen() {
                     .nestedScroll(fabNestedScroll),
                 contentPadding = contentPadding,
             ) {
-                itemsIndexed(rows, key = { _, row -> rowKey(row) }) { _, row ->
-                    when (row) {
-                        is PrewarmRow.Progress -> PrewarmTotalProgress(row.completed, row.total)
-
-                        is PrewarmRow.Header -> {
-                            val dragging = draggedSourceId == row.sourceId
-                            PrewarmHeaderRow(
+                items(rows, key = { rowKey(it) }) { row ->
+                    ReorderableItem(reorderState, key = rowKey(row)) { isDragging ->
+                        val dragHandle = Modifier.draggableHandle(
+                            onDragStarted = {
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                        )
+                        when (row) {
+                            is PrewarmRow.Header -> PrewarmHeaderRow(
                                 title = row.title,
                                 itemCount = row.count,
-                                dragging = dragging,
-                                dragOffset = if (dragging) dragOffset else 0f,
-                                dragKey = headerKey(row.sourceId),
-                                onDragStart = { beginDrag(headerKey(row.sourceId), null, row.sourceId) },
-                                onDrag = { delta -> updateDrag(delta) },
-                                onDragEnd = { endDrag() },
+                                dragging = isDragging,
+                                dragHandle = dragHandle,
                                 onCancelSource = { viewModel.cancelSource(row.sourceId) },
                             )
-                        }
 
-                        is PrewarmRow.Chapter -> {
-                            val dragging = draggedChapterId == row.item.chapterId
-                            PrewarmItemRow(
+                            is PrewarmRow.Chapter -> PrewarmItemRow(
                                 item = row.item,
-                                dragging = dragging,
-                                dragOffset = if (dragging) dragOffset else 0f,
-                                dragKey = row.item.chapterId,
-                                onDragStart = { beginDrag(row.item.chapterId, row.item.chapterId, null) },
-                                onDrag = { delta -> updateDrag(delta) },
-                                onDragEnd = { endDrag() },
+                                dragging = isDragging,
+                                dragHandle = dragHandle,
                                 onCancel = { viewModel.cancel(row.item) },
+                                onRetry = { viewModel.retry(row.item.chapterId) },
                                 onOpenManga = { navigator.push(MangaScreen(row.item.mangaId)) },
+                                onMoveToTop = { viewModel.moveChapterToTop(row.item.chapterId) },
+                                onMoveToBottom = { viewModel.moveChapterToBottom(row.item.chapterId) },
                             )
                         }
-
-                        PrewarmRow.Stats -> Text(
-                            text = stringResource(
-                                MR.strings.prewarm_stats_summary,
-                                stats.enhancedPages,
-                                stats.cacheHitPages,
-                                stats.failedPages,
-                            ),
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                        )
                     }
                 }
             }
         }
 
         if (showPolicyDialog) {
-            BatteryPolicyDialog(
+            PrewarmSettingsDialog(
                 selected = batteryPolicy,
-                onSelect = {
-                    viewModel.setBatteryPolicy(it)
-                    showPolicyDialog = false
-                },
+                onSelect = { viewModel.setBatteryPolicy(it) },
+                downloadPromptMode = prewarmAfterDownload,
+                onResetDownloadPrompt = viewModel::resetDownloadPrompt,
                 onDismiss = { showPolicyDialog = false },
             )
         }
     }
 
-    private enum class PrewarmCardState { RUNNING, WAITING_CHARGE, LOW_BATTERY, WAITING_READER, DONE }
-
-    /**
-     * Flattened rendering model: the drag gesture needs a stable key per row to translate a finger
-     * position back into "which chapter / which series block", which raw queue indices cannot do
-     * once headers and progress rows are interleaved.
-     */
     private sealed interface PrewarmRow {
-        data class Progress(val completed: Int, val total: Int) : PrewarmRow
         data class Header(val sourceId: Long, val title: String, val count: Int) : PrewarmRow
         data class Chapter(val item: PrewarmItem) : PrewarmRow
-        object Stats : PrewarmRow
     }
 
     private const val HEADER_KEY_PREFIX = "header-"
@@ -394,99 +346,52 @@ object PrewarmQueueScreen : Screen() {
     private fun rowKey(row: PrewarmRow): Any = when (row) {
         is PrewarmRow.Header -> headerKey(row.sourceId)
         is PrewarmRow.Chapter -> row.item.chapterId
-        is PrewarmRow.Progress -> "total-progress"
-        PrewarmRow.Stats -> "stats"
     }
 
-    private fun buildRows(queue: List<PrewarmItem>, stats: PrewarmSessionStats): List<PrewarmRow> = buildList {
-        val totalPages = queue.sumOf { it.totalPages }
-        if (totalPages > 0) {
-            add(PrewarmRow.Progress(queue.sumOf { it.pagesCompleted }, totalPages))
-        }
-        // Same two levels as the download queue: a source header, then rows that name the manga
-        // and the chapter. Grouping only by manga made the two screens read differently.
+    /**
+     * Flattens the queue into the rendered rows: one source header, then its chapters.
+     *
+     * The screen no longer interleaves progress or statistics rows: they made the list read
+     * differently from the download queue and pushed the chapters the user came for off screen.
+     */
+    private fun buildRows(queue: List<PrewarmItem>): List<PrewarmRow> = buildList {
         queue.groupBy { it.sourceId }.forEach { (sourceId, items) ->
             val title = items.first().sourceName.ifBlank { items.first().mangaTitle }
             add(PrewarmRow.Header(sourceId, title, items.size))
             items.forEach { add(PrewarmRow.Chapter(it)) }
         }
-        if (stats.enhancedPages > 0 || stats.cacheHitPages > 0 || stats.failedPages > 0) {
-            add(PrewarmRow.Stats)
-        }
-    }
-
-    @Composable
-    private fun prewarmSortLabel(sort: PrewarmSort): String = when (sort) {
-        PrewarmSort.QUEUED -> stringResource(MR.strings.prewarm_sort_queue_order)
-        PrewarmSort.CHAPTER_ASC -> stringResource(MR.strings.action_order_by_chapter_number) +
-            " · " + stringResource(MR.strings.action_asc)
-        PrewarmSort.CHAPTER_DESC -> stringResource(MR.strings.action_order_by_chapter_number) +
-            " · " + stringResource(MR.strings.action_desc)
-        PrewarmSort.CUSTOM -> ""
     }
 
     /**
-     * One line describing what the queue is doing right now, shown as the app bar subtitle.
-     * Pause reasons carry their own explanation so the charging rule reads as a default
-     * behaviour instead of a hard limit.
+     * Commits one drag step to the queue.
+     *
+     * A chapter only moves inside its own series block and a header only among headers, which is
+     * the same containment the download queue enforces in [shouldMove]: letting a row walk into
+     * another block would claim a chapter belongs to a different manga.
      */
-    @Composable
-    private fun prewarmStatusLine(
-        state: PrewarmCardState?,
-        queue: List<PrewarmItem>,
-        stats: PrewarmSessionStats,
-        lastCompletion: PrewarmCompletionSummary?,
-    ): String? {
-        val runningItem = queue.firstOrNull { it.status == PrewarmStatus.RUNNING }
-        return when (state) {
-            null -> null
-            // The running chapter is already highlighted in the list below, so the subtitle only
-            // needs the state word and the page progress.
-            PrewarmCardState.RUNNING -> if (runningItem != null && runningItem.totalPages > 0) {
-                stringResource(MR.strings.prewarm_card_running) + " · " +
-                    stringResource(
-                        MR.strings.prewarm_status_running,
-                        runningItem.pagesCompleted,
-                        runningItem.totalPages,
-                    )
-            } else {
-                stringResource(MR.strings.prewarm_card_running)
+    private fun moveRow(
+        fromIndex: Int,
+        toIndex: Int,
+        rows: List<PrewarmRow>,
+        viewModel: PrewarmQueueViewModel,
+    ) {
+        val from = rows.getOrNull(fromIndex) ?: return
+        val to = rows.getOrNull(toIndex) ?: return
+        when {
+            from is PrewarmRow.Chapter && to is PrewarmRow.Chapter &&
+                from.item.mangaId == to.item.mangaId -> {
+                val block = rows.filterIsInstance<PrewarmRow.Chapter>()
+                    .filter { it.item.mangaId == from.item.mangaId }
+                val targetIndex = block.indexOfFirst { it.item.chapterId == to.item.chapterId }
+                if (targetIndex >= 0) viewModel.moveChapter(from.item.chapterId, targetIndex)
             }
-            PrewarmCardState.WAITING_CHARGE -> stringResource(MR.strings.prewarm_card_waiting_charge) +
-                " · " + stringResource(MR.strings.prewarm_card_waiting_charge_desc)
-            PrewarmCardState.LOW_BATTERY -> stringResource(MR.strings.prewarm_card_low_battery) +
-                " · " + stringResource(MR.strings.prewarm_card_low_battery_desc)
-            PrewarmCardState.WAITING_READER -> stringResource(MR.strings.prewarm_card_waiting_reader) +
-                " · " + stringResource(MR.strings.prewarm_card_waiting_reader_desc)
-            // Prefers the just-finished run so a second batch does not report the sum of both.
-            PrewarmCardState.DONE -> stringResource(MR.strings.prewarm_card_done) + " · " + stringResource(
-                MR.strings.prewarm_card_done_desc,
-                lastCompletion?.pageCount ?: stats.enhancedPages,
-            )
-        }
-    }
 
-    /**
-     * One-line summary of what the queue is doing right now. Each pause reason is
-     * paired with the action that lifts it, so the charging rule reads as a default
-     * behaviour instead of a hard limit.
-     */
-    private fun prewarmCardState(
-        queue: List<PrewarmItem>,
-        stats: PrewarmSessionStats,
-    ): PrewarmCardState? {
-        val active = queue.filter { it.status.isActive }
-        if (active.isEmpty()) {
-            return if (queue.isNotEmpty() && stats.enhancedPages > 0) PrewarmCardState.DONE else null
+            from is PrewarmRow.Header && to is PrewarmRow.Header -> {
+                val headers = rows.filterIsInstance<PrewarmRow.Header>()
+                val targetIndex = headers.indexOfFirst { it.sourceId == to.sourceId }
+                if (targetIndex >= 0) viewModel.moveSource(from.sourceId, targetIndex)
+            }
         }
-        if (active.any { it.status == PrewarmStatus.RUNNING }) return PrewarmCardState.RUNNING
-        val pauseReasons = active
-            .filter { it.status == PrewarmStatus.PAUSED }
-            .mapTo(HashSet()) { it.pauseReason }
-        if (PrewarmPauseReason.LOW_BATTERY in pauseReasons) return PrewarmCardState.LOW_BATTERY
-        if (PrewarmPauseReason.WAITING_CHARGE in pauseReasons) return PrewarmCardState.WAITING_CHARGE
-        if (PrewarmPauseReason.READER_ACTIVE in pauseReasons) return PrewarmCardState.WAITING_READER
-        return null
     }
 
     @Composable
@@ -496,17 +401,34 @@ object PrewarmQueueScreen : Screen() {
         else -> stringResource(MR.strings.prewarm_battery_policy_charge_only)
     }
 
+    /**
+     * The queue's own settings: whether prewarming runs at all, and the charging rule it obeys.
+     * Both belong to the queue rather than the reader's image settings.
+     */
     @Composable
-    private fun BatteryPolicyDialog(
+    private fun PrewarmSettingsDialog(
         selected: Int,
         onSelect: (Int) -> Unit,
+        downloadPromptMode: Int,
+        onResetDownloadPrompt: () -> Unit,
         onDismiss: () -> Unit,
     ) {
         AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text(text = stringResource(MR.strings.prewarm_battery_policy_title)) },
+            title = { Text(text = stringResource(MR.strings.prewarm_settings)) },
             text = {
                 Column {
+                    Text(
+                        text = stringResource(MR.strings.prewarm_uses_reader_settings),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+                    Text(
+                        text = stringResource(MR.strings.prewarm_battery_policy_title),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                     listOf(
                         ReaderPreferences.BATTERY_POLICY_CHARGE_ONLY to MR.strings.prewarm_battery_policy_charge_only,
                         ReaderPreferences.BATTERY_POLICY_SUFFICIENT to MR.strings.prewarm_battery_policy_sufficient,
@@ -524,7 +446,10 @@ object PrewarmQueueScreen : Screen() {
                                 style = MaterialTheme.typography.bodyMedium,
                                 modifier = Modifier.weight(1f),
                             )
-                            RadioButton(selected = selected == value, onClick = { onSelect(value) })
+                            RadioButton(
+                                selected = selected == value,
+                                onClick = { onSelect(value) },
+                            )
                         }
                     }
                     Text(
@@ -532,6 +457,32 @@ object PrewarmQueueScreen : Screen() {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+                    // The download-time question is asked from the manga screen; when it has been
+                    // turned off, this is the only place that can bring it back.
+                    Text(
+                        text = stringResource(
+                            MR.strings.prewarm_after_download_state,
+                            stringResource(
+                                when (downloadPromptMode) {
+                                    ReaderPreferences.PREWARM_AFTER_DOWNLOAD_ALWAYS ->
+                                        MR.strings.prewarm_after_download_state_always
+                                    ReaderPreferences.PREWARM_AFTER_DOWNLOAD_NEVER ->
+                                        MR.strings.prewarm_after_download_state_never
+                                    else -> MR.strings.prewarm_after_download_state_ask
+                                },
+                            ),
+                        ),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    if (downloadPromptMode != ReaderPreferences.PREWARM_AFTER_DOWNLOAD_ASK) {
+                        TextButton(
+                            onClick = onResetDownloadPrompt,
+                            modifier = Modifier.padding(top = 4.dp),
+                        ) {
+                            Text(stringResource(MR.strings.prewarm_after_download_reset))
+                        }
+                    }
                 }
             },
             confirmButton = {
@@ -540,85 +491,27 @@ object PrewarmQueueScreen : Screen() {
         )
     }
 
-    /**
-     * Session-wide progress: every queued chapter counts, so the bar also covers
-     * pages that were already cached from an earlier run.
-     */
-    @Composable
-    private fun PrewarmTotalProgress(completed: Int, total: Int) {
-        val fraction = (completed.toFloat() / total).coerceIn(0f, 1f)
-        val label = stringResource(MR.strings.prewarm_total_progress, completed, total)
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 4.dp),
-        ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            LinearProgressIndicator(
-                progress = { fraction },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp)
-                    .semantics { contentDescription = label },
-            )
-        }
-    }
-
     @Composable
     private fun PrewarmHeaderRow(
         title: String,
         itemCount: Int,
         dragging: Boolean,
-        dragOffset: Float,
-        dragKey: Any,
-        onDragStart: () -> Unit,
-        onDrag: (Float) -> Unit,
-        onDragEnd: () -> Unit,
+        dragHandle: Modifier,
         onCancelSource: () -> Unit,
     ) {
         var menuExpanded by remember { mutableStateOf(false) }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .zIndex(if (dragging) 1f else 0f)
-                .graphicsLayer { translationY = dragOffset }
-                .background(
-                    if (dragging) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent,
-                )
-                .padding(start = 4.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
+                .background(if (dragging) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
+                .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Dragging the header moves the whole series block; rows can only move inside it.
-            Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .pointerInput(dragKey) {
-                        detectDragGesturesAfterLongPress(
-                            onDragStart = { onDragStart() },
-                            onDrag = { change, delta ->
-                                change.consume()
-                                onDrag(delta.y)
-                            },
-                            onDragEnd = { onDragEnd() },
-                            onDragCancel = { onDragEnd() },
-                        )
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = MaterialSymbols.Rounded.DragHandle,
-                    contentDescription = stringResource(MR.strings.prewarm_drag_handle),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
             Text(
                 // Same shape as the download queue header: title plus how many rows it holds.
                 text = "$title ($itemCount)",
-                style = MaterialTheme.typography.titleMedium,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Medium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
@@ -643,48 +536,11 @@ object PrewarmQueueScreen : Screen() {
                     )
                 }
             }
-        }
-    }
-
-    @Composable
-    private fun PrewarmItemRow(
-        item: PrewarmItem,
-        dragging: Boolean,
-        dragOffset: Float,
-        dragKey: Any,
-        onDragStart: () -> Unit,
-        onDrag: (Float) -> Unit,
-        onDragEnd: () -> Unit,
-        onCancel: () -> Unit,
-        onOpenManga: () -> Unit,
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .zIndex(if (dragging) 1f else 0f)
-                .graphicsLayer { translationY = dragOffset }
-                .background(
-                    if (dragging) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent,
-                )
-                .clickable(onClick = onOpenManga)
-                .padding(start = 4.dp, end = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // An explicit handle keeps the row tappable for "open manga" while drag stays available.
+            // Handle at the end, like the download queue's section header.
             Box(
                 modifier = Modifier
                     .size(44.dp)
-                    .pointerInput(dragKey) {
-                        detectDragGesturesAfterLongPress(
-                            onDragStart = { onDragStart() },
-                            onDrag = { change, delta ->
-                                change.consume()
-                                onDrag(delta.y)
-                            },
-                            onDragEnd = { onDragEnd() },
-                            onDragCancel = { onDragEnd() },
-                        )
-                    },
+                    .then(dragHandle),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
@@ -693,96 +549,173 @@ object PrewarmQueueScreen : Screen() {
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Column(modifier = Modifier.weight(1f)) {
-                // Two levels like a download row: manga first, then the chapter.
-                Text(
-                    text = item.mangaTitle,
-                    style = MaterialTheme.typography.bodyLarge,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 6.dp),
+        }
+    }
+
+    @Composable
+    private fun PrewarmItemRow(
+        item: PrewarmItem,
+        dragging: Boolean,
+        dragHandle: Modifier,
+        onCancel: () -> Unit,
+        onOpenManga: () -> Unit,
+        onMoveToTop: () -> Unit,
+        onMoveToBottom: () -> Unit,
+        onRetry: () -> Unit,
+    ) {
+        var menuExpanded by remember { mutableStateOf(false) }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(if (dragging) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
+                .clickable(onClick = onOpenManga)
+                .padding(start = 4.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // An explicit handle keeps the row tappable for "open manga" while drag stays available.
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .then(dragHandle),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = MaterialSymbols.Rounded.DragHandle,
+                    contentDescription = stringResource(MR.strings.prewarm_drag_handle),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 4.dp),
+            ) {
+                // Same two lines as a download row: manga first, then the chapter.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = item.mangaTitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    val progressText = progressText(item)
+                    if (progressText.isNotEmpty()) {
+                        Text(
+                            text = progressText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            modifier = Modifier.padding(start = 8.dp),
+                        )
+                    }
+                }
                 Text(
-                    text = item.chapterName,
-                    style = MaterialTheme.typography.bodyMedium,
+                    text = chapterLine(item),
+                    fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(top = 2.dp),
                 )
-                Text(
-                    text = statusText(item),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 2.dp, bottom = 6.dp),
+                // Always drawn, like the download row: a queued page simply sits at 0%.
+                LinearProgressIndicator(
+                    progress = { item.progressFraction() },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp, bottom = 4.dp),
                 )
-                // A bar only while the pages are actually moving: finished rows already say how many
-                // pages they produced, and queued rows would just draw a 0% bar.
-                if (item.totalPages > 0 &&
-                    (
-                        item.status == PrewarmStatus.RUNNING ||
-                            (item.status == PrewarmStatus.PAUSED && item.pagesCompleted > 0)
-                        )
-                ) {
-                    val progressLabel = stringResource(
-                        MR.strings.prewarm_chapter_progress,
-                        item.pagesCompleted,
-                        item.totalPages,
-                    )
-                    LinearProgressIndicator(
-                        progress = { (item.pagesCompleted.toFloat() / item.totalPages).coerceIn(0f, 1f) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 6.dp)
-                            .semantics { contentDescription = progressLabel },
+            }
+            Box {
+                IconButton(onClick = { menuExpanded = true }) {
+                    Icon(
+                        imageVector = MaterialSymbols.Rounded.MoreVert,
+                        contentDescription = stringResource(MR.strings.action_menu),
                     )
                 }
-            }
-            // Finished, skipped and failed rows can be dismissed too: the queue is a list of
-            // results as much as a list of pending work.
-            IconButton(onClick = onCancel) {
-                Icon(
-                    imageVector = MaterialSymbols.Rounded.Close,
-                    contentDescription = stringResource(
-                        if (item.status.isActive) MR.strings.action_cancel else MR.strings.action_remove,
-                    ),
-                )
+                // Same actions as the download row's menu.
+                DropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false },
+                ) {
+                    // Only a chapter that ended badly can be retried; the menu does not offer a
+                    // no-op on rows that are queued or running.
+                    if (item.status == PrewarmStatus.ERROR || item.status == PrewarmStatus.SKIPPED) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(MR.strings.prewarm_retry)) },
+                            onClick = {
+                                menuExpanded = false
+                                onRetry()
+                            },
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text(stringResource(MR.strings.action_move_to_top)) },
+                        onClick = {
+                            menuExpanded = false
+                            onMoveToTop()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(MR.strings.action_move_to_bottom)) },
+                        onClick = {
+                            menuExpanded = false
+                            onMoveToBottom()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                stringResource(
+                                    if (item.status.isActive) MR.strings.action_cancel else MR.strings.action_remove,
+                                ),
+                            )
+                        },
+                        onClick = {
+                            menuExpanded = false
+                            onCancel()
+                        },
+                    )
+                }
             }
         }
     }
 
+    /** Download-style counter: how many pages of this chapter are already usable. */
+    private fun progressText(item: PrewarmItem): String {
+        if (item.totalPages <= 0) return ""
+        return "${item.pagesCompleted}/${item.totalPages}"
+    }
+
+    /** Chapter name, with the pause/skip reason appended instead of a third text line. */
     @Composable
-    private fun statusText(item: PrewarmItem): String {
-        return when (item.status) {
-            PrewarmStatus.QUEUED -> stringResource(MR.strings.prewarm_status_queued)
-            PrewarmStatus.RUNNING -> if (item.totalPages > 0) {
-                stringResource(MR.strings.prewarm_status_running, item.pagesCompleted, item.totalPages)
-            } else {
-                stringResource(MR.strings.prewarm_status_queued)
-            }
-            PrewarmStatus.PAUSED -> {
-                val reason = when (item.pauseReason) {
-                    PrewarmPauseReason.WAITING_CHARGE -> stringResource(MR.strings.prewarm_paused_waiting_charge)
-                    PrewarmPauseReason.LOW_BATTERY -> stringResource(MR.strings.prewarm_paused_low_battery)
-                    PrewarmPauseReason.READER_ACTIVE -> stringResource(MR.strings.prewarm_paused_reader_active)
-                    PrewarmPauseReason.PREWARM_DISABLED -> stringResource(MR.strings.prewarm_paused_prewarm_disabled)
-                    PrewarmPauseReason.ENHANCEMENT_DISABLED -> {
-                        stringResource(MR.strings.prewarm_paused_enhancement_disabled)
-                    }
-                    PrewarmPauseReason.MANUAL, PrewarmPauseReason.NONE -> null
+    private fun chapterLine(item: PrewarmItem): String {
+        val reason = when (item.status) {
+            PrewarmStatus.PAUSED -> when (item.pauseReason) {
+                PrewarmPauseReason.WAITING_CHARGE -> stringResource(MR.strings.prewarm_paused_waiting_charge)
+                PrewarmPauseReason.LOW_BATTERY -> stringResource(MR.strings.prewarm_paused_low_battery)
+                PrewarmPauseReason.READER_ACTIVE -> stringResource(MR.strings.prewarm_paused_reader_active)
+                PrewarmPauseReason.PREWARM_DISABLED -> stringResource(MR.strings.prewarm_paused_prewarm_disabled)
+                PrewarmPauseReason.ENHANCEMENT_DISABLED -> {
+                    stringResource(MR.strings.prewarm_paused_enhancement_disabled)
                 }
-                val base = stringResource(MR.strings.paused)
-                if (reason != null) "$base • $reason" else base
+                PrewarmPauseReason.MANUAL, PrewarmPauseReason.NONE -> null
             }
-            PrewarmStatus.DONE -> stringResource(MR.strings.prewarm_status_done, item.totalPages)
             PrewarmStatus.SKIPPED -> when (item.skipReason) {
                 PrewarmSkipReason.CACHE_BUDGET_EXCEEDED -> stringResource(MR.strings.prewarm_skip_cache_budget)
+                PrewarmSkipReason.AUTO_SPLIT_UNSUPPORTED -> stringResource(MR.strings.prewarm_skip_auto_split)
                 PrewarmSkipReason.CHAPTER_UNAVAILABLE, null -> {
                     stringResource(MR.strings.prewarm_skip_chapter_unavailable)
                 }
-                PrewarmSkipReason.AUTO_SPLIT_UNSUPPORTED -> stringResource(MR.strings.prewarm_skip_auto_split)
             }
             PrewarmStatus.ERROR -> stringResource(MR.strings.prewarm_status_error, item.pagesFailed)
+            else -> null
         }
+        return if (reason == null) item.chapterName else "${item.chapterName} · $reason"
+    }
+
+    private fun PrewarmItem.progressFraction(): Float {
+        if (totalPages <= 0) return 0f
+        return (pagesCompleted.toFloat() / totalPages).coerceIn(0f, 1f)
     }
 }

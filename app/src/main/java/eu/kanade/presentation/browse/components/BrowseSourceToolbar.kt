@@ -123,6 +123,14 @@ fun BrowseSourceToolbar(
                             ),
                         )
                     }
+                    if (!isLocalSource) {
+                        add(
+                            AppBar.OverflowAction(
+                                title = stringResource(MR.strings.action_open_in_web_view),
+                                onClick = onWebViewClick,
+                            ),
+                        )
+                    }
                     if (isConfigurableSource) {
                         add(
                             AppBar.OverflowAction(
