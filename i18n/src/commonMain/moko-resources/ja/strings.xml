@@ -1070,4 +1070,13 @@
     <string name="pref_performance_item_battery">バッテリー</string>
     <string name="reader_performance_items_limit">同時に表示できるのは 2 項目までです</string>
     <string name="reader_battery_usage_label">バッテリー %1$d%%</string>
+
+    <string name="pref_category_enhancement">画像補正</string>
+    <string name="pref_enhancement_enabled">画像補正を有効にする</string>
+    <string name="pref_enhancement_route">処理経路</string>
+    <string name="pref_enhancement_cache">補正キャッシュを削除</string>
+    <string name="pref_enhancement_cache_cleared">補正キャッシュを削除しました</string>
+    <string name="enhancement_route_vulkan">Vulkan GPU（実験的）</string>
+    <string name="enhancement_route_npu">Qualcomm NPU</string>
+    <string name="enhancement_route_mtk">MediaTek NPU</string>
 </resources>

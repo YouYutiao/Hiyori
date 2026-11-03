@@ -253,6 +253,27 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
     private var stripRequest: Disposable? = null
 
+    /**
+     * Guards the "this segment never got an image" hole.
+     *
+     * Every strip binding starts by disposing the previous request, and the enhanced-swap paths
+     * then enqueue a replacement. A request that is disposed (or that lands on a stale binding and
+     * returns early) is never followed by a success or an error callback, so the segment keeps an
+     * empty strip view while its holder reserves a full screen — the page reads as a black gap and
+     * nothing retries it. The watchdog re-issues the binding from the original source once.
+     */
+    private var stripWatchdog: Runnable? = null
+    private var stripWatchdogRetries = 0
+
+    /**
+     * True while a strip request is still running.
+     *
+     * The watchdog must only rescue a request that died, never one that is merely slow: cancelling
+     * a live decode throws away a whole page of work, decodes it again and can end on the error
+     * layout. Large pages routinely take longer than the watchdog delay.
+     */
+    private var stripRequestInFlight = false
+
     private var config: Config? = null
 
     private var processingJob: Job? = null
@@ -1094,6 +1115,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
     fun setImage(drawable: Drawable, config: Config) {
         imageRevision++
         hasDisplayedImage = false
+        stripWatchdogRetries = 0
         pendingInitialEnhancement = null
         processingJob?.cancel()
         currentCachedFile = null
@@ -1118,6 +1140,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
     ) {
         imageRevision++
         hasDisplayedImage = false
+        stripWatchdogRetries = 0
         pendingInitialEnhancement = null
         processingJob?.cancel()
         // A first frame that is decoded straight from the enhanced cache must remember which entry
@@ -1162,6 +1185,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
         this.config = config
         currentCachedFile = file
         currentLoadedUri = file.toURI().toString()
+        // A fresh binding starts with a full retry budget. This entry is the usual first frame of
+        // an already enhanced page, and without the reset a page that used its budget would leave
+        // the next page with none.
+        stripWatchdogRetries = 0
         prepareStripImageView()
         updateEnhanceState(PageEnhanceState.Enhanced)
         requestCachedStrips(file, config)
@@ -1170,6 +1197,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
     fun recycle() {
         stripRequest?.dispose()
         stripRequest = null
+        stripWatchdog?.let(::removeCallbacks)
+        stripWatchdog = null
+        stripWatchdogRetries = 0
+        stripRequestInFlight = false
         imageRevision++
         hasDisplayedImage = false
         pendingInitialEnhancement = null
@@ -1592,6 +1623,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
      */
     private fun reloadProcessedStrips(view: WebtoonStripImageView, data: BufferedSource) {
         stripRequest?.dispose()
+        armStripWatchdog(view)
         val revision = imageRevision
         stripRequest = ImageRequest.Builder(context)
             // Peeking leaves the data whole for decoding again after the strips were freed off screen
@@ -1600,16 +1632,28 @@ open class ReaderPageImageView @JvmOverloads constructor(
             .diskCachePolicy(CachePolicy.DISABLED)
             .target(
                 onSuccess = { result ->
-                    if (revision != imageRevision || pageView !== view) return@target
+                    if (revision != imageRevision || pageView !== view) {
+                        restoreOriginalStrips(view, "enhanced swap result superseded")
+                        return@target
+                    }
                     view.onReload = { reloadProcessedStrips(view, data) }
+                    stripRequestInFlight = false
                     view.setImage(result as ImageDecoder.StripsImage)
                     view.isVisible = true
                     view.alpha = 1f
+                    logcat(LogPriority.DEBUG) {
+                        "ReaderPageImageView: page=$pageIndex enhanced strips bound hasImage=${view.hasImage}"
+                    }
                     onImageLoaded()
                 },
             )
             .listener(
                 onError = { _, result ->
+                    logcat(LogPriority.WARN) {
+                        "ReaderPageImageView: page=$pageIndex enhanced strips failed: ${result.throwable.message}"
+                    }
+                    stripRequestInFlight = false
+                    stripRequestInFlight = false
                     onImageLoadError(result.throwable)
                 },
             )
@@ -1631,22 +1675,35 @@ open class ReaderPageImageView @JvmOverloads constructor(
         val view = pageView as? WebtoonStripImageView ?: return
         val revision = imageRevision
         stripRequest?.dispose()
+        armStripWatchdog(view)
         stripRequest = ImageRequest.Builder(context)
             .data(file)
             .memoryCachePolicy(CachePolicy.DISABLED)
             .diskCachePolicy(CachePolicy.DISABLED)
             .target(
                 onSuccess = { result ->
-                    if (revision != imageRevision || pageView !== view) return@target
+                    if (revision != imageRevision || pageView !== view) {
+                        restoreOriginalStrips(view, "cached swap result superseded")
+                        return@target
+                    }
                     view.onReload = { requestCachedStrips(file, config) }
+                    stripRequestInFlight = false
                     view.setImage(result as ImageDecoder.StripsImage)
                     view.isVisible = true
                     view.alpha = 1f
+                    logcat(LogPriority.DEBUG) {
+                        "ReaderPageImageView: page=$pageIndex cached strips bound hasImage=${view.hasImage}"
+                    }
                     onImageLoaded()
                 },
             )
             .listener(
                 onError = { _, result ->
+                    logcat(LogPriority.WARN) {
+                        "ReaderPageImageView: page=$pageIndex cached strips failed: ${result.throwable.message}"
+                    }
+                    stripRequestInFlight = false
+                    stripRequestInFlight = false
                     onImageLoadError(result.throwable)
                 },
             )
@@ -1662,6 +1719,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
     private fun requestStrips(view: WebtoonStripImageView, data: BufferedSource, config: Config, isReload: Boolean) {
         // A recycled view is reused for another page, where a request still running for the old one must not land
         stripRequest?.dispose()
+        armStripWatchdog(view)
         stripRequest = ImageRequest.Builder(context)
             // Peeking leaves the data whole for decoding again after the strips were freed off screen
             .data(data.peek())
@@ -1669,7 +1727,12 @@ open class ReaderPageImageView @JvmOverloads constructor(
             .diskCachePolicy(CachePolicy.DISABLED)
             .target(
                 onSuccess = { result ->
+                    stripRequestInFlight = false
                     view.setImage(result as ImageDecoder.StripsImage)
+                    logcat(LogPriority.DEBUG) {
+                        "ReaderPageImageView: page=$pageIndex source strips bound hasImage=${view.hasImage} " +
+                            "current=${pageView === view} reload=$isReload"
+                    }
                     if (!isReload) {
                         view.isVisible = true
                         onImageLoaded()
@@ -1678,6 +1741,11 @@ open class ReaderPageImageView @JvmOverloads constructor(
             )
             .listener(
                 onError = { _, result ->
+                    logcat(LogPriority.WARN) {
+                        "ReaderPageImageView: page=$pageIndex source strips failed: ${result.throwable.message}"
+                    }
+                    stripRequestInFlight = false
+                    stripRequestInFlight = false
                     onImageLoadError(result.throwable)
                 },
             )
@@ -1688,6 +1756,84 @@ open class ReaderPageImageView @JvmOverloads constructor(
             .crossfade(false)
             .build()
             .let(context.imageLoader::enqueue)
+    }
+
+    /**
+     * Terminal-state guarantee for a segment: if nothing is on screen, decode the original bytes.
+     *
+     * Both swap paths used to `return@target` when a newer binding had already superseded them,
+     * which is neither a success nor an error, so the segment kept an empty strip view while its
+     * holder reserved a full screen (a black gap with a progress arc). Whenever this view is still
+     * the current one and still empty, the original bytes are bound again.
+     */
+    private fun restoreOriginalStrips(view: WebtoonStripImageView, reason: String) {
+        if (pageView !== view) {
+            logcat(LogPriority.DEBUG) { "ReaderPageImageView: $reason ignored, page=$pageIndex view rebound" }
+            return
+        }
+        if (view.hasImage) {
+            logcat(LogPriority.DEBUG) { "ReaderPageImageView: $reason ignored, page=$pageIndex already drawn" }
+            return
+        }
+        if (stripWatchdogRetries >= STRIP_WATCHDOG_MAX_RETRIES) {
+            logcat(LogPriority.ERROR) {
+                "ReaderPageImageView: page=$pageIndex still empty after $stripWatchdogRetries retries; showing error"
+            }
+            onImageLoadError(IllegalStateException("Segment produced no image: $reason"))
+            return
+        }
+        stripWatchdogRetries++
+        val source = originalStreamFn
+        if (source == null) {
+            logcat(LogPriority.ERROR) { "ReaderPageImageView: page=$pageIndex $reason, no original source" }
+            onImageLoadError(IllegalStateException("Segment source unavailable: $reason"))
+            return
+        }
+        logcat(LogPriority.WARN) {
+            "ReaderPageImageView: page=$pageIndex $reason, rebuilding from source (attempt $stripWatchdogRetries)"
+        }
+        val revision = imageRevision
+        viewScope.launchIO {
+            val bytes = runCatching { source().use { Buffer().readFrom(it) } }.getOrNull()
+            withUIContext {
+                val displayConfig = config
+                when {
+                    bytes == null -> onImageLoadError(IllegalStateException("Segment source unavailable"))
+                    displayConfig == null -> onImageLoadError(IllegalStateException("Segment config missing"))
+                    // Reading the bytes takes long enough for the holder to be rebound to another
+                    // page. The strip view instance is reused, so comparing the view alone is not
+                    // enough: without the revision the previous page's bytes land on this one.
+                    pageView !== view || revision != imageRevision -> Unit
+                    !isAttachedToWindow -> Unit
+                    else -> setStripImage(bytes, displayConfig)
+                }
+            }
+        }
+    }
+
+    /**
+     * Re-issues a strip binding when the current one produced nothing.
+     *
+     * See [stripWatchdog]. The retry rebuilds the segment from the original bytes rather than
+     * from the enhanced cache: the cache is what the dropped request was swapping in, and a
+     * readable original is always better than a black gap.
+     */
+    private fun armStripWatchdog(view: WebtoonStripImageView) {
+        stripWatchdog?.let(::removeCallbacks)
+        stripRequestInFlight = true
+        val runnable = Runnable {
+            if (pageView !== view || view.hasImage) return@Runnable
+            if (!isAttachedToWindow || !isShown) return@Runnable
+            if (stripRequestInFlight) {
+                logcat(LogPriority.DEBUG) {
+                    "ReaderPageImageView: page=$pageIndex strip request still running; not rescuing"
+                }
+                return@Runnable
+            }
+            restoreOriginalStrips(view, "strip watchdog fired (${STRIP_WATCHDOG_MS}ms)")
+        }
+        stripWatchdog = runnable
+        postDelayed(runnable, STRIP_WATCHDOG_MS)
     }
 
     private fun prepareAnimatedImageView() {
@@ -1753,6 +1899,8 @@ open class ReaderPageImageView @JvmOverloads constructor(
             )
             .listener(
                 onError = { _, result ->
+                    stripRequestInFlight = false
+                    stripRequestInFlight = false
                     onImageLoadError(result.throwable)
                 },
             )
@@ -1810,3 +1958,8 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
 private const val MAX_ZOOM_SCALE = 5F
 private const val PROCESSED_SWAP_DURATION_MS = 280L
+
+// Long enough for a local strip decode to finish, short enough that a dropped request does not
+// leave a black gap on screen for the rest of the read.
+private const val STRIP_WATCHDOG_MS = 1500L
+private const val STRIP_WATCHDOG_MAX_RETRIES = 2

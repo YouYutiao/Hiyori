@@ -15,6 +15,9 @@
 #include <jni.h>
 #include <mutex>
 #include <vector>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -31,6 +34,9 @@ static std::atomic<int> g_current_id{-1};
 static std::atomic<int> g_ui_busy{0};
 static std::atomic<bool> g_abort_processing{false};
 static bool g_realcugan_pro = false;
+// True while any Real-CUGAN variant (SE or Pro) is loaded. The texture-occupancy
+// guard is a property of this model family, not of the Pro weights.
+static bool g_realcugan_family = false;
 static int g_requested_backend = 0;
 
 namespace {
@@ -69,6 +75,19 @@ void force_monochrome_output(unsigned char *rgba, int width, int height,
       pixel[2] = luma;
     }
   }
+}
+
+// Debug-only: skip the fused Vulkan pipeline so the staged path can be exercised on its
+// own. adb shell setprop debug.hiyori.force_staged 1. Release builds compile it out.
+bool force_staged() {
+#if !defined(NDEBUG)
+  char value[PROP_VALUE_MAX] = {};
+  if (__system_property_get("debug.hiyori.force_staged", value) > 0 &&
+      value[0] == '1') {
+    return true;
+  }
+#endif
+  return false;
 }
 
 }  // namespace
@@ -183,6 +202,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInit(JNIEnv *env,
   std::lock_guard<std::mutex> lock(g_lock);
   g_abort_processing = false;
   g_realcugan_pro = false;
+  g_realcugan_family = false;
 
   qnn_backend::shutdown();
   litert_backend::shutdown();
@@ -252,6 +272,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitWaifu2xUpconv7(
   std::lock_guard<std::mutex> lock(g_lock);
   g_abort_processing = false;
   g_realcugan_pro = false;
+  g_realcugan_family = false;
 
   qnn_backend::shutdown();
   litert_backend::shutdown();
@@ -363,12 +384,25 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
     // chroma for neutral pages. Most colour pages exit during the fast sample.
     const bool is_monochrome_input = monochrome_guard::is_neutral_rgba(
         static_cast<const unsigned char *>(packed_input.data), w, h);
-    // The 75% shrink-and-restore pass is a Real-CUGAN Pro workaround for
-    // chroma blocks on neutral manga scans. Keep it out of SE and other model
-    // families, and let both native backends consume the same tile plan.
+    // The 75% shrink-and-restore pass protects Real-CUGAN's per-tile
+    // squeeze-and-excitation blocks from locking onto a dense halftone. It is a
+    // property of the model family, so both SE and Pro use it; the per-tile plan
+    // keeps it off ordinary line art. Both native backends consume the same plan.
+    // Debug builds can turn the guard off at runtime, so one APK can be A/B'd on the very
+    // same source page: adb shell setprop debug.hiyori.texture_guard 0 (and clear the cache,
+    // because the plan does not take part in the cache key). Release builds compile it out.
+    bool guard_enabled = g_realcugan_family;
+#if !defined(NDEBUG)
+    char guard_property[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.hiyori.texture_guard", guard_property) > 0 &&
+        guard_property[0] == '0') {
+      guard_enabled = false;
+    }
+    LOGD("Texture occupancy guard: enabled=%d", guard_enabled ? 1 : 0);
+#endif
     periodic_texture_guard::Analysis texture_analysis(
         static_cast<const unsigned char *>(packed_input.data), w, h, w * 4,
-        g_realcugan_pro && is_monochrome_input);
+        guard_enabled);
 
     if (g_waifu2x) {
       int out_w = w * g_waifu2x->scale;
@@ -422,9 +456,10 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
             const auto qnn_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - qnn_start)
                                     .count();
-            LOGD("QNN HTP processing %s in %lld ms",
+            LOGD("QNN HTP processing %s in %lld ms (aborted=%d)",
                  ret == 0 ? "completed" : "failed",
-                 static_cast<long long>(qnn_ms));
+                 static_cast<long long>(qnn_ms),
+                 g_abort_processing.load() ? 1 : 0);
           }
 
           if (g_requested_backend == 2 && litert_backend::is_initialized()) {
@@ -438,10 +473,16 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
           const periodic_texture_guard::TilePlan *ncnn_texture_plan = nullptr;
           if (g_requested_backend == 0 && ret != 0 && !g_abort_processing.load()) {
             ncnn_texture_plan = &texture_analysis.plan(g_waifu2x->tilesize);
+            int risky_tiles = 0;
+            for (uint8_t risky : ncnn_texture_plan->risky) risky_tiles += risky != 0;
+            LOGD("Texture occupancy plan: core=%d grid=%dx%d risky=%d any=%d",
+                 ncnn_texture_plan->core, ncnn_texture_plan->columns,
+                 ncnn_texture_plan->rows, risky_tiles,
+                 ncnn_texture_plan->any_risky ? 1 : 0);
           }
           if (g_requested_backend == 0 && ret != 0 && !g_abort_processing.load() &&
               ncnn_texture_plan && !ncnn_texture_plan->any_risky &&
-              g_waifu2x->has_gpu_pipeline()) {
+              !force_staged() && g_waifu2x->has_gpu_pipeline()) {
             const auto fused_start = std::chrono::steady_clock::now();
             ret = g_waifu2x->process_gpu(packed_input, outPixels,
                                          outInfo.stride, input_has_alpha,
@@ -455,7 +496,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
           }
 
           if (g_requested_backend == 0 && ret != 0 && !g_abort_processing.load()) {
-            LOGD("Fused GPU pipeline unavailable for this image; retrying staged path");
+            LOGD("Staged path selected (fused unavailable or risky tiles); processing");
             const auto staged_start = std::chrono::steady_clock::now();
             ncnn::Mat in = ncnn::Mat::from_pixels(
                 (const unsigned char *)packed_input.data,
@@ -586,6 +627,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeDestroy(JNIEnv *env,
   g_progress.store(0);
   g_current_id.store(-1);
   g_realcugan_pro = false;
+  g_realcugan_family = false;
   g_abort_processing.store(false);
   // DO NOT call destroy_gpu_instance here. It should be global.
   // Repeatedly calling it on exit/init is slow and can cause hangs.
@@ -686,6 +728,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealCugan(
   std::lock_guard<std::mutex> lock(g_lock);
   g_abort_processing = false; // Reset
   g_realcugan_pro = is_pro == JNI_TRUE;
+  g_realcugan_family = true;
 
   qnn_backend::shutdown();
   litert_backend::shutdown();
@@ -797,6 +840,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealESRGAN(
   std::lock_guard<std::mutex> lock(g_lock);
   g_abort_processing = false;
   g_realcugan_pro = false;
+  g_realcugan_family = false;
 
   qnn_backend::shutdown();
   litert_backend::shutdown();
@@ -861,6 +905,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitW2xEx(
   std::lock_guard<std::mutex> lock(g_lock);
   g_abort_processing = false;
   g_realcugan_pro = false;
+  g_realcugan_family = false;
 
   qnn_backend::shutdown();
   litert_backend::shutdown();
@@ -923,6 +968,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitNose(
   std::lock_guard<std::mutex> lock(g_lock);
   g_abort_processing = false;
   g_realcugan_pro = false;
+  g_realcugan_family = false;
 
   ncnn::create_gpu_instance();
 

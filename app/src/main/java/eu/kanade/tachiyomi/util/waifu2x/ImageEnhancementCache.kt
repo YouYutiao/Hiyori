@@ -33,9 +33,17 @@ object ImageEnhancementCache {
 
     // Input decoding now preserves source resolution before enhancement.
     private const val ENHANCEMENT_INPUT_DECODE_REVISION = 1
-    private const val REAL_CUGAN_TEXTURE_OCCUPANCY_REVISION = 3
+    private const val REAL_CUGAN_TEXTURE_OCCUPANCY_REVISION = 4
     private const val MONOCHROME_INPUT_NORMALIZATION_REVISION = 3
     private const val REAL_ESRGAN_PHOTO_NCNN_REVISION = 2
+
+    // Bumped when the meaning of a cache entry changes (key layout, guard behaviour, model
+    // preprocessing). Unlike the per-key revisions this one clears the directory, so a release
+    // that changes cached output does not leave the previous copy of every page on disk.
+    private const val CACHE_FORMAT_VERSION = 1
+    private const val PREFERENCES_NAME = "enhancement_cache"
+    private const val KEY_CACHE_FORMAT_VERSION = "format_version"
+
     private const val MAX_CACHE_SIZE = 3L * 1024 * 1024 * 1024 // 3GB
     private var cacheDir: File? = null
 
@@ -152,6 +160,49 @@ object ImageEnhancementCache {
                 directory.mkdirs()
             }
         }
+    }
+
+    /**
+     * Drops every cached page when the cache format changed.
+     *
+     * The revision appended to the key already makes old entries unreachable, but the files stay on
+     * disk until the 3 GB trim reclaims them, so an upgrade would briefly hold two copies of every
+     * enhanced page. Upgrades are rare and pages have to be re-enhanced after one anyway, so the
+     * directory is emptied instead of waiting for the trim.
+     *
+     * Runs on the caller's IO coroutine, never on the main thread: it deletes the whole tree.
+     */
+    fun resetForVersionChange(context: Context) {
+        val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+        val storedVersion = preferences.getInt(KEY_CACHE_FORMAT_VERSION, 0)
+        if (storedVersion == CACHE_FORMAT_VERSION) return
+
+        // Reuse the regular clear path instead of deleting the directory here: it also bumps the
+        // cache generation so a save already in flight cannot write an old-format file back after
+        // the delete, drops the pending saves, clears the prewarmed index (which would otherwise
+        // keep claiming chapters are ready) and notifies every listener.
+        val cleared = runCatching { clear(context) }.isSuccess
+        if (!cleared) {
+            android.util.Log.w(
+                "ImageEnhancementCache",
+                "Cache clear failed; keeping format $storedVersion so it is retried",
+            )
+            return
+        }
+        preferences.edit().putInt(KEY_CACHE_FORMAT_VERSION, CACHE_FORMAT_VERSION).apply()
+        android.util.Log.i(
+            "ImageEnhancementCache",
+            "Cache format $storedVersion -> $CACHE_FORMAT_VERSION: cleared",
+        )
+    }
+
+    /** Total bytes currently held by the enhancement cache. Blocking: call it off the main thread. */
+    fun totalSizeBytes(context: Context): Long {
+        init(context)
+        val directory = cacheLock.read { cacheDir } ?: return 0L
+        return runCatching {
+            directory.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        }.getOrDefault(0L)
     }
 
     /**
@@ -687,7 +738,10 @@ object ImageEnhancementCache {
             if (resolvedBackend == Waifu2x.PROCESSING_BACKEND_MEDIATEK_NPU) {
                 append("_mtv${eu.kanade.tachiyomi.util.mediatek.MediaTekNpu.CACHE_VERSION}")
             }
-            if (model == 1 || (model == 0 && noise == 3)) {
+            // The texture-occupancy guard applies to the whole Real-CUGAN family now, so every
+            // Real-CUGAN entry carries the revision: otherwise an SE page enhanced before the
+            // guard existed would be served from cache and the guard would never run on it.
+            if (model == 0 || model == 1) {
                 append("_tv$REAL_CUGAN_TEXTURE_OCCUPANCY_REVISION")
             }
         }

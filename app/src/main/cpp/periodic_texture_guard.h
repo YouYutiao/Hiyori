@@ -20,8 +20,8 @@ constexpr int kEdgeDensityPercent = 18;
 // clusters of short strokes cannot trigger a whole-tile resize.
 constexpr int kDirectionalCoveragePercent = 70;
 constexpr int kRiskyCellPercent = 50;
-constexpr int kShrinkNumerator = 3;
-constexpr int kShrinkDenominator = 4;
+// The shrink factor is 3/4 of the tile with the border removed from both ends;
+// see AxisTransform for why the split is derived from the length, not from 3/4.
 
 // Detect a large, nearly one-dimensional screentone. Ordinary line art may
 // contain a few directional cells, but the Real-CUGAN failure needs that
@@ -89,7 +89,19 @@ bool occupies_too_much(int width, int height, Sample sample,
           gx >= std::max(1, gy) * kDirectionRatio &&
           density_x >= kEdgeDensityPercent &&
           active_rows_x * 100 >= sample_height * kDirectionalCoveragePercent;
-      risky_cells += horizontal || vertical;
+      // A halftone dot screen is periodic on BOTH axes, so its gradients are
+      // isotropic: neither direction wins by kDirectionRatio and the cell never
+      // looked directional. Real-CUGAN's per-tile squeeze-and-excitation then
+      // amplifies whatever phase it locked onto, which is the tile-aligned
+      // stripe/noise block seen on dense scans. Treat a cell that is periodic on
+      // both axes as risky too, with the same per-axis thresholds the
+      // one-directional test uses.
+      const bool isotropic =
+          gx >= kDominantGradient && gy >= kDominantGradient &&
+          density_x >= kEdgeDensityPercent && density_y >= kEdgeDensityPercent &&
+          active_rows_x * 100 >= sample_height * kDirectionalCoveragePercent &&
+          active_columns_y * 100 >= sample_width * kDirectionalCoveragePercent;
+      risky_cells += horizontal || vertical || isotropic;
       ++total_cells;
       // Callers requesting diagnostics still receive complete counts. For a
       // boolean decision, stop as soon as remaining cells cannot change it.
@@ -175,12 +187,19 @@ private:
 // Both backends use the same pixel-center mapping. Edge tiles need the actual
 // rounded resize ratio: restoring at exactly 3/4 would shift their crop whenever
 // the padded source length is not a multiple of four. Length must be positive.
+//
+// The border is derived from the length rather than from the scaled length, so
+// that the split is exact for every length: border + scaled_length + border ==
+// length. Computing scaled_length first (length * 3 / 4) leaves a remainder
+// whenever the trimmed pixels are odd — 164 yields 123 + 20 + 20 = 163, and the
+// leftover column is white padding, which the model then paints into the tile
+// and the restore copies into the page as a grid of seams.
 struct AxisTransform {
   explicit AxisTransform(int length)
-      : scaled_length(std::max(1, length * kShrinkNumerator / kShrinkDenominator)),
-        border((length - scaled_length) / 2),
-        shrink_ratio(static_cast<float>(scaled_length) / length),
-        inverse_ratio(static_cast<float>(length) / scaled_length) {}
+      : scaled_length(std::max(1, length - 2 * (std::max(1, length) / 8))),
+        border(std::max(0, std::max(1, length) / 8)),
+        shrink_ratio(static_cast<float>(scaled_length) / std::max(1, length)),
+        inverse_ratio(static_cast<float>(std::max(1, length)) / scaled_length) {}
 
   float source_coordinate(int destination) const {
     return (destination - border + 0.5f) * inverse_ratio - 0.5f;

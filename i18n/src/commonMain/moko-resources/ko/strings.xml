@@ -1076,4 +1076,13 @@
     <string name="pref_performance_item_battery">배터리</string>
     <string name="reader_performance_items_limit">한 번에 최대 2개까지 표시할 수 있습니다</string>
     <string name="reader_battery_usage_label">배터리 %1$d%%</string>
+
+    <string name="pref_category_enhancement">이미지 개선</string>
+    <string name="pref_enhancement_enabled">이미지 개선 사용</string>
+    <string name="pref_enhancement_route">처리 경로</string>
+    <string name="pref_enhancement_cache">개선 캐시 지우기</string>
+    <string name="pref_enhancement_cache_cleared">개선 캐시를 지웠습니다</string>
+    <string name="enhancement_route_vulkan">Vulkan GPU(실험적)</string>
+    <string name="enhancement_route_npu">Qualcomm NPU</string>
+    <string name="enhancement_route_mtk">MediaTek NPU</string>
 </resources>

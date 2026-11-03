@@ -6,6 +6,7 @@ import android.content.Context
 import coil3.SingletonImageLoader
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
+import coil3.request.allowHardware
 import eu.kanade.tachiyomi.data.coil.chapterId
 import eu.kanade.tachiyomi.data.coil.customDecoder
 import eu.kanade.tachiyomi.data.coil.enhanced
@@ -171,6 +172,9 @@ object ImageEnhancer {
                     if (e !is InterruptedException && e !is CancellationException) {
                         logcat(LogPriority.ERROR, e) { "ImageEnhancer: Worker loop error" }
                     }
+                } catch (e: OutOfMemoryError) {
+                    // An optional enhancement must never kill the process or stop the queue for good.
+                    logcat(LogPriority.ERROR, e) { "ImageEnhancer: Not enough memory for enhancement" }
                 }
             }
         }
@@ -505,6 +509,9 @@ object ImageEnhancer {
             val request = ImageRequest.Builder(req.context)
                 .data(data)
                 .memoryCachePolicy(CachePolicy.DISABLED)
+                // The result is read back and re-encoded, so a hardware bitmap buys nothing and
+                // can fail to allocate while the reader is already holding several pages.
+                .allowHardware(false)
                 .customDecoder(true)
                 .enhanced(true)
                 .mangaId(req.mangaId)
@@ -574,6 +581,9 @@ object ImageEnhancer {
         if (!runtimeInitialized.compareAndSet(false, true)) return
 
         scope.launch {
+            // An upgrade changes what a cached page means, and the old files would otherwise sit
+            // next to the new ones until the size trim reclaimed them.
+            ImageEnhancementCache.resetForVersionChange(context)
             ImageEnhancementCache.checkAndTrim(context)
             updatePerformanceSettings()
         }
@@ -612,12 +622,22 @@ object ImageEnhancer {
     }
 
     private fun preemptForVisibleRequest(pageIndex: Int, pageVariant: String) {
-        if (activePageIndex >= 0 &&
-            (activePageIndex != pageIndex || activePageVariant != pageVariant) &&
-            !isFocusedTarget(activePageIndex, activePageVariant)
-        ) {
-            preemptActiveRequest("visible page requested", requeue = activePageIndex > targetPageIndex)
+        if (activePageIndex < 0) return
+        if (activePageIndex == pageIndex && activePageVariant == pageVariant) return
+        if (isFocusedTarget(activePageIndex, activePageVariant)) return
+
+        // Only the page just ahead of the visible one is worth finishing: it becomes visible next,
+        // so its work is about to be needed. A page behind the visible one has already been read;
+        // finishing it delays the page the reader is looking at, so it is given up immediately.
+        if (isWithinPreemptKeepWindow(activePageIndex, pageIndex)) {
+            logcat(LogPriority.DEBUG) {
+                "ImageEnhancer: Keeping active page $activePageIndex " +
+                    "(distance=${activePageIndex - pageIndex}) while page $pageIndex becomes visible"
+            }
+            return
         }
+
+        preemptActiveRequest("visible page requested", requeue = activePageIndex > targetPageIndex)
     }
 
     private fun preemptActiveRequest(reason: String, requeue: Boolean = false) {
@@ -634,3 +654,15 @@ object ImageEnhancer {
         activeJob?.cancel(CancellationException("Image enhancement preempted: $reason"))
     }
 }
+
+// How far the active page may be from the visible one before its work is thrown away.
+private const val PREEMPT_KEEP_DISTANCE_PAGES = 2
+
+/**
+ * Whether the page being processed is close enough ahead of the visible one to finish.
+ *
+ * Only pages the reader is about to reach are worth finishing: a page behind the visible one has
+ * already been read, so keeping it would delay the page on screen. See [PREEMPT_KEEP_DISTANCE_PAGES].
+ */
+internal fun isWithinPreemptKeepWindow(activeIndex: Int, visibleIndex: Int): Boolean =
+    activeIndex > visibleIndex && activeIndex - visibleIndex <= PREEMPT_KEEP_DISTANCE_PAGES

@@ -50,10 +50,15 @@ int main() {
   require(!detect([](int x, int y) {
             return x % 64 < 2 || y % 64 < 2 ? 0 : 255;
           }), "panel borders are safe");
-  require(!detect([](int x, int y) { return ((x + y) / 2) % 2 ? 255 : 0; }),
-          "diagonal hatching is not a one-dimensional axis-aligned tone");
-  require(!detect([](int x, int y) { return (x / 2 + y / 2) % 2 ? 255 : 0; }),
-          "two-dimensional checker texture is safe");
+  // Both are dense screens covering the whole tile, which is exactly the texture Real-CUGAN
+  // re-invents. They used to be exempt because the guard only understood one-dimensional tones.
+  require(detect([](int x, int y) { return ((x + y) / 2) % 2 ? 255 : 0; }),
+          "dense diagonal hatching must soften the tile");
+  require(detect([](int x, int y) { return (x / 2 + y / 2) % 2 ? 255 : 0; }),
+          "dense two-dimensional dot screen must soften the tile");
+  require(!detect([](int x, int y) {
+            return x < 32 && y < 32 && x % 2 == 0 && y % 2 == 0 ? 0 : 255;
+          }), "a small dot cluster cannot exceed the tile occupancy threshold");
   for (int percent : {25, 50, 75}) {
     require(detect([=](int x, int y) {
               return x < 128 * percent / 100 ? ((y / 2) % 2 ? 255 : 0) : 128;
@@ -143,12 +148,18 @@ int main() {
   // A linear ramp survives bilinear sampling exactly. Simulate resizing, a
   // scale-factor model output, then restoration to catch phase shifts and
   // white-border leakage, especially for odd partial tiles.
+  for (int tiny : {1, 7, 8, 9}) {
+    const AxisTransform axis(tiny);
+    require(axis.border * 2 + axis.scaled_length == tiny,
+            "tiny tiles still split exactly");
+    require(axis.scaled_length >= 1, "shrink never reaches zero");
+  }
   for (int core : {1, 7, 17, 63, 64, 127, 128, 220, 221}) {
     for (int padding : {14, 18}) {
       const int length = core + 2 * padding;
       const AxisTransform axis(length);
-      require(axis.scaled_length == length * 3 / 4,
-              "guard keeps the 75 percent shrink size");
+      require(axis.border * 2 + axis.scaled_length == length,
+              "shrink split is exact, so no padding column is left white");
       require(axis.border >= 0 && axis.border + axis.scaled_length <= length,
               "shrunk content fits inside the padded inference tile");
       for (int scale : {2, 3, 4}) {

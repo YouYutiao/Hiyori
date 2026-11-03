@@ -28,6 +28,16 @@ class WebtoonStripImageView(context: Context) : View(context) {
     /** Decodes the page again after its strips were freed off screen. */
     var onReload: (() -> Unit)? = null
 
+    /**
+     * Whether this view can actually draw its segment.
+     *
+     * Deliberately not `imageWidth > 0`: [onDetachedFromWindow] frees the strips of a large page but
+     * keeps the size so the layout does not jump, so a released view still reports a width. Using
+     * the size would make every "is anything on screen" check pass in exactly the state that needs
+     * recovering.
+     */
+    val hasImage: Boolean get() = strips.isNotEmpty()
+
     private var isReleasedOffScreen = false
 
     fun setImage(image: ImageDecoder.StripsImage) {

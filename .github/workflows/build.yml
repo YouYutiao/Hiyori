@@ -22,6 +22,27 @@ permissions:
   contents: read
 
 jobs:
+  # The guard headers are the only part of the native code with host-runnable tests, and until now
+  # nothing compiled them: a change could break the regression without any job turning red.
+  native-tests:
+    name: Native Guard Tests
+    runs-on: 'ubuntu-26.04'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build and run guard tests
+        run: |
+          set -euo pipefail
+          for source in app/src/test/cpp/*_test.cpp; do
+            name=$(basename "$source" .cpp)
+            echo "::group::$name"
+            g++ -std=c++17 -O2 -Wall -Wextra -Werror -I app/src/main/cpp "$source" -o "/tmp/$name"
+            "/tmp/$name"
+            echo "::endgroup::"
+          done
+
   build:
     name: Build & Test App
     runs-on: 'ubuntu-26.04'

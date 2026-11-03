@@ -320,7 +320,7 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                                         // --- End Resolution Limits / Prescale ---
 
                                         if (shouldSkipEnhancement) {
-                                            // Don't process, just use the original bitmap
+                                            markEnhancementSkipped()
                                         } else {
                                             currentCoroutineContext().ensureActive()
                                             val initialized = when (model) {
@@ -484,6 +484,7 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
+                                    markEnhancementSkipped()
                                     logcat(LogPriority.ERROR, e) {
                                         "TachiyomiImageDecoder: Failed to enhance image on-the-fly"
                                     }
@@ -505,10 +506,35 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
             } catch (e: Exception) {
                 logcat(LogPriority.ERROR, e) { "TachiyomiImageDecoder: Critical failure during decode" }
                 null
+            } catch (e: OutOfMemoryError) {
+                markEnhancementSkipped()
+                logcat(LogPriority.ERROR, e) {
+                    "TachiyomiImageDecoder: Not enough memory; keeping original reader image"
+                }
+                null
             } finally {
                 bitmap?.let { if (!it.isRecycled) it.recycle() }
             }
         }
+    }
+
+    /**
+     * Records that this page must not be retried.
+     *
+     * A failed or skipped enhancement used to leave no trace, so the status poll asked for the page
+     * again and again and it never reached a terminal state (the reader showed it as still enhancing
+     * forever). The skip marker is what turns that into a definite "keep the original".
+     */
+    private fun markEnhancementSkipped() {
+        if (!options.enhanced || options.mangaId == -1L || options.chapterId == -1L || options.pageIndex < 0) return
+        val preferences = Injekt.get<ReaderPreferences>()
+        ImageEnhancementCache.saveSkippedToCache(
+            options.mangaId,
+            options.chapterId,
+            options.pageIndex,
+            ImageEnhancementCache.getConfigHash(preferences),
+            options.pageVariant,
+        )
     }
 
     private fun decodeCachedEnhancedImage(): Bitmap? {

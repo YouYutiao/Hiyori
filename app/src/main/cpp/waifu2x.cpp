@@ -782,30 +782,35 @@ int Waifu2x::process(const ncnn::Mat &inimage, void *out_pixels, int out_stride,
       }
 
       const bool guard_tile = texture_plan.guards(x, y);
-      const periodic_texture_guard::AxisTransform guard_x(in_tile_w);
-      const periodic_texture_guard::AxisTransform guard_y(in_tile_h);
-      if (guard_tile) {
-        ncnn::Mat scaled_tile;
-        ncnn::resize_bilinear(in_tile, scaled_tile, guard_x.scaled_length,
-                              guard_y.scaled_length, net.opt);
-        ncnn::Mat guarded_input(in_tile_w, in_tile_h, 3);
-        guarded_input.fill(1.0f);
-        for (int c = 0; c < 3; ++c) {
-          const ncnn::Mat source = scaled_tile.channel(c);
-          ncnn::Mat destination = guarded_input.channel(c);
-          for (int row = 0; row < guard_y.scaled_length; ++row) {
-            memcpy(destination.row(guard_y.border + row) + guard_x.border,
-                   source.row(row), guard_x.scaled_length * sizeof(float));
-          }
-        }
-        in_tile = guarded_input;
-        ++guarded_texture_tiles;
-        LOGD("Guarding periodic texture tile %d,%d", xi, yi);
-      }
 
       // Run inference on tile (GPU WORK)
       ncnn::Mat out_tile;
-      {
+      if (guard_tile) {
+        // The NCNN path cannot run the shrink-and-restore pass: the restored tile ends up
+        // with a different effective scale than its neighbours, and on dense screentone the
+        // model also re-invents the pattern, so text used to come back duplicated and the
+        // tile edges shifted. Upscale those tiles directly instead: softer, but it never
+        // invents structure and never moves content. The QNN backend, whose tile geometry
+        // is exact, keeps the shrink pass.
+        ncnn::Mat core(w_tile, h_tile, 3);
+        for (int c = 0; c < 3; ++c) {
+          const float *ptr = in_tile.channel(c).row(prepadding) + prepadding;
+          float *outptr = core.channel(c);
+          for (int i = 0; i < h_tile; ++i) {
+            memcpy(outptr, ptr, w_tile * sizeof(float));
+            ptr += in_tile.w;
+            outptr += core.w;
+          }
+        }
+        ncnn::resize_bicubic(core, out_tile, w_tile * scale, h_tile * scale,
+                             net.opt);
+        if (out_tile.empty()) {
+          LOGE("Guarded tile fallback failed at %d,%d", xi, yi);
+          return -1;
+        }
+        ++guarded_texture_tiles;
+        LOGD("Screentone tile %d,%d upscaled without the model", xi, yi);
+      } else {
         ncnn::Extractor ex = net.create_extractor();
         ex.set_light_mode(true);
         if (net.input_indexes().empty() || net.output_indexes().empty()) {
@@ -893,7 +898,7 @@ int Waifu2x::process(const ncnn::Mat &inimage, void *out_pixels, int out_stride,
 
           if (dst_y >= target_h)
             break;
-          if (!guard_tile && src_y >= out_tile_captured.h)
+          if (src_y >= out_tile_captured.h)
             break;
 
           unsigned char *dst_row =
@@ -914,14 +919,14 @@ int Waifu2x::process(const ncnn::Mat &inimage, void *out_pixels, int out_stride,
           int copy_w = out_w_tile;
           if (out_x + copy_w > target_w)
             copy_w = target_w - out_x;
-          if (!guard_tile && src_offset_x + copy_w > out_tile_captured.w)
+          if (src_offset_x + copy_w > out_tile_captured.w)
             copy_w = out_tile_captured.w - src_offset_x;
 
           int j = 0;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
           const float32x4_t scale_255 = vdupq_n_f32(255.f);
           const float32x4_t gray_scale = vdupq_n_f32(1.f / 3.f);
-          for (; !guard_tile && j + 8 <= copy_w; j += 8) {
+          for (; j + 8 <= copy_w; j += 8) {
             float32x4_t r0 = vmulq_f32(vld1q_f32(ptr_r + j), scale_255);
             float32x4_t r1 = vmulq_f32(vld1q_f32(ptr_r + j + 4), scale_255);
             float32x4_t g0 = vmulq_f32(vld1q_f32(ptr_g + j), scale_255);
@@ -950,39 +955,9 @@ int Waifu2x::process(const ncnn::Mat &inimage, void *out_pixels, int out_stride,
           }
 #endif
           for (; j < copy_w; j++) {
-            float r;
-            float g;
-            float b;
-            if (!guard_tile) {
-              r = ptr_r[j] * 255.0f;
-              g = ptr_g[j] * 255.0f;
-              b = ptr_b[j] * 255.0f;
-            } else {
-              const float sample_x =
-                  guard_x.restored_output_coordinate(j, prepadding, scale);
-              const float sample_y =
-                  guard_y.restored_output_coordinate(i, prepadding, scale);
-              const int x0 = std::clamp(static_cast<int>(std::floor(sample_x)),
-                                        0, out_tile_captured.w - 1);
-              const int y0 = std::clamp(static_cast<int>(std::floor(sample_y)),
-                                        0, out_tile_captured.h - 1);
-              const int x1 = std::min(out_tile_captured.w - 1, x0 + 1);
-              const int y1 = std::min(out_tile_captured.h - 1, y0 + 1);
-              const float fx = sample_x - std::floor(sample_x);
-              const float fy = sample_y - std::floor(sample_y);
-              const auto sample = [&](const float *channel) {
-                const float top = channel[y0 * out_tile_captured.w + x0] *
-                                      (1.0f - fx) +
-                                  channel[y0 * out_tile_captured.w + x1] * fx;
-                const float bottom = channel[y1 * out_tile_captured.w + x0] *
-                                         (1.0f - fx) +
-                                     channel[y1 * out_tile_captured.w + x1] * fx;
-                return (top * (1.0f - fy) + bottom * fy) * 255.0f;
-              };
-              b = sample(tile_b);
-              g = sample(tile_g);
-              r = sample(tile_r);
-            }
+            float r = ptr_r[j] * 255.0f;
+            float g = ptr_g[j] * 255.0f;
+            float b = ptr_b[j] * 255.0f;
 
             if (is_grayscale) {
               float gray = (r + g + b) * 0.333333f;

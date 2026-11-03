@@ -66,6 +66,14 @@
     <string name="app_not_available">应用无法使用</string>
     <string name="pref_category_general">常规</string>
     <string name="pref_category_reader">阅读</string>
+    <string name="pref_category_enhancement">图像增强</string>
+    <string name="pref_enhancement_enabled">启用图像增强</string>
+    <string name="pref_enhancement_route">处理路线</string>
+    <string name="pref_enhancement_cache">清空增强缓存</string>
+    <string name="pref_enhancement_cache_cleared">增强缓存已清空</string>
+    <string name="enhancement_route_vulkan">Vulkan GPU（实验）</string>
+    <string name="enhancement_route_npu">高通 NPU</string>
+    <string name="enhancement_route_mtk">联发科 NPU</string>
     <string name="pref_category_downloads">下载</string>
     <string name="pref_category_tracking">进度记录</string>
     <string name="pref_category_advanced">高级</string>

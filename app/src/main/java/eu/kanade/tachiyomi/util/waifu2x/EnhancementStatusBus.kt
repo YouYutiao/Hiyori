@@ -52,6 +52,19 @@ object EnhancementStatusBus {
 
     /** State of [pageIndex] within the chapter that most recently published. */
     fun stateFor(pageIndex: Int): PageEnhanceState? = states.value[currentChapterId to pageIndex]
+
+    /**
+     * Same lookup against an already-collected snapshot.
+     *
+     * The overlay must pass the map it collected from [states]: reading [states] directly here is
+     * invisible to Compose, so a page that finished enhancing while it was on screen kept showing
+     * "processing" until some unrelated change forced a recomposition (the reader only noticed the
+     * update after scrolling away and back).
+     */
+    fun stateFor(
+        pageIndex: Int,
+        snapshot: Map<Pair<Long, Int>, PageEnhanceState>,
+    ): PageEnhanceState? = snapshot[currentChapterId to pageIndex]
 }
 
 /** Label resource and format argument for the overlay badge. */

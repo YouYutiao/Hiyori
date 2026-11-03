@@ -10,6 +10,8 @@ import eu.kanade.tachiyomi.util.qnn.QnnModelContexts
 import eu.kanade.tachiyomi.util.qnn.QualcommHtp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import logcat.LogPriority
+import tachiyomi.core.common.util.system.logcat
 import java.io.BufferedInputStream
 import java.io.File
 import java.net.HttpURLConnection
@@ -1121,6 +1123,7 @@ object Waifu2x {
     private external fun nativeProcess(input: Bitmap, id: Int): Bitmap?
     private external fun nativeDestroy()
     private external fun nativeAbortProcessing()
+
     private external fun nativeClearAbortProcessing()
     private external fun nativeSetUiBusy(busy: Boolean)
     private external fun nativeSetProcessingBackend(backend: Int)

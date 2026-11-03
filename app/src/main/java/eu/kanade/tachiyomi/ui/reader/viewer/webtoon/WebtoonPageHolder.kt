@@ -174,17 +174,23 @@ class WebtoonPageHolder(
 
     /**
      * Whether this segment is close enough to the viewport that decoding its enhanced strips now is
-     * not wasted work. One screen above and one below: the strip one flick away is the one the
-     * reader looks at next, and anything further out would only raise memory use.
+     * not wasted work.
+     *
+     * Two screens ahead, one behind: a page takes about four seconds to enhance and a reader covers
+     * a screen every second or two, so one screen of lead only just arrived in time. Looking further
+     * back is pointless because those pages were already read, and any further ahead would raise
+     * memory use without being seen sooner.
      */
     private fun ReaderPageImageView.isWithinPredecodeWindow(): Boolean {
         if (isVisibleOnScreen()) return true
         if (!isShown) return false
         val location = IntArray(2)
         getLocationOnScreen(location)
-        val screenHeight = context.resources.displayMetrics.heightPixels
-        val top = location[1]
-        return top < screenHeight * 2 && top + height > -screenHeight
+        return isWithinPredecodeWindow(
+            top = location[1],
+            height = height,
+            screenHeight = context.resources.displayMetrics.heightPixels,
+        )
     }
 
     /**
@@ -623,3 +629,7 @@ class WebtoonPageHolder(
         }
     }
 }
+
+/** Two screens ahead, one behind: see [WebtoonPageHolder.isWithinPredecodeWindow]. */
+internal fun isWithinPredecodeWindow(top: Int, height: Int, screenHeight: Int): Boolean =
+    top < screenHeight * 3 && top + height > -screenHeight

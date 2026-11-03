@@ -734,15 +734,18 @@ private:
             value = input[static_cast<size_t>(source_y) * stride +
                           static_cast<size_t>(source_x) * 4 + channel] /
                     255.0f;
-          } else if (x < guard.border || y < guard.border ||
-                     x >= guard.border + guard.scaled_length ||
-                     y >= guard.border + guard.scaled_length) {
-            value = 1.0f;
           } else {
+            // Extend the shrunken content with its own edge pixels instead of a white
+            // frame: white sits inside the model's receptive field and gets painted back
+            // into the tile, which is what showed up as a seam around every guarded tile.
+            const int guard_x = std::clamp(
+                x, guard.border, guard.border + guard.scaled_length - 1);
+            const int guard_y = std::clamp(
+                y, guard.border, guard.border + guard.scaled_length - 1);
             const float source_x = origin_x +
-                guard.source_coordinate(x);
+                guard.source_coordinate(guard_x);
             const float source_y = origin_y +
-                guard.source_coordinate(y);
+                guard.source_coordinate(guard_y);
             const int x0 = static_cast<int>(std::floor(source_x));
             const int y0 = static_cast<int>(std::floor(source_y));
             const float fx = source_x - x0;

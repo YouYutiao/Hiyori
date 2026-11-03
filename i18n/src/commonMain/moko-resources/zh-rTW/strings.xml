@@ -1119,4 +1119,13 @@
     <string name="pref_performance_item_battery">電量</string>
     <string name="reader_performance_items_limit">最多同時顯示兩項</string>
     <string name="reader_battery_usage_label">電量 %1$d%%</string>
+
+    <string name="pref_category_enhancement">圖像增強</string>
+    <string name="pref_enhancement_enabled">啟用圖像增強</string>
+    <string name="pref_enhancement_route">處理路線</string>
+    <string name="pref_enhancement_cache">清除增強快取</string>
+    <string name="pref_enhancement_cache_cleared">增強快取已清除</string>
+    <string name="enhancement_route_vulkan">Vulkan GPU（實驗）</string>
+    <string name="enhancement_route_npu">Qualcomm NPU</string>
+    <string name="enhancement_route_mtk">MediaTek NPU</string>
 </resources>

@@ -371,7 +371,7 @@ class ReaderActivity : BaseActivity() {
 
         Box(modifier = Modifier.fillMaxSize()) {
             val enhanceStates by EnhancementStatusBus.states.collectAsState()
-            val currentPageEnhanceState = EnhancementStatusBus.stateFor(state.currentPage)
+            val currentPageEnhanceState = EnhancementStatusBus.stateFor(state.currentPage, enhanceStates)
 
             // Visibility, placement and style are three independent choices; deriving them once
             // keeps the page number marker and both corner badges in sync with the same settings.

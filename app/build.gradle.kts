@@ -154,8 +154,8 @@ android {
     defaultConfig {
         applicationId = "app.hiyori"
 
-        versionCode = 7
-        versionName = "0.1.3"
+        versionCode = 8
+        versionName = "0.1.4"
         buildConfigField("int", "UPSTREAM_VERSION_CODE", "38")
 
         buildConfigField("boolean", "TELEMETRY_INCLUDED", "${Config.includeTelemetry}")
@@ -199,7 +199,12 @@ android {
 
     buildTypes {
         val debug = getByName("debug") {
+            // Coexists with the release package (app.hiyori) so a test build can be installed
+            // next to it without replacing the user's data.
             applicationIdSuffix = ".dev"
+            // Release metadata stays at the last published version until the batch is uploaded;
+            // the suffix is what makes a local test build identifiable in the app.
+            versionNameSuffix = "-exp"
             isPseudoLocalesEnabled = true
         }
         val release = getByName("release") {
